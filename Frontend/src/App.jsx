@@ -18,8 +18,10 @@ import {
   RotateCcw,
   Cloud,
   CloudOff,
+  Square,
+  X,
 } from "lucide-react";
-import VibeForgeLogo from "../../buildanything/Frontend/src/components/VibeForgeLogo";
+import VibeForgeLogo from "./components/VibeForgeLogo";
 import {
   AreaChart,
   Area,
@@ -45,7 +47,8 @@ Respond with ONLY a raw JSON object, no markdown fences, no preamble, no explana
   "summary": "one sentence, past tense, what they actually did",
   "openLoops": ["short phrase for each unresolved thread, 0-3 items"],
   "nextStep": "one concrete, immediately actionable next action",
-  "xpValue": integer from 5 to 30 based on effort/impact implied by the note
+  "xpValue": integer from 5 to 30 based on effort/impact implied by the note,
+  "matchedStep": "the exact text of a plan step (from the 'Current plan' list below the note, if present) that this capture completes, or null if none apply or no plan is listed"
 }
 
 Rules:
@@ -54,7 +57,22 @@ Rules:
 - openLoops are short noun phrases, not full sentences.
 - nextStep is a single next action, not a list.
 - xpValue: 5-10 for small/quick items, 11-20 for solid focused work, 21-30 for a shipped feature or hard unblock.
+- matchedStep must be copied EXACTLY, character-for-character, from the provided plan step list — never paraphrase it. Only set it if the note clearly indicates that step is now complete. When unsure, use null.
 - If the note is too vague to parse confidently, still return your best-effort JSON — never ask a clarifying question, never return anything but the JSON object.`;
+
+const PLAN_EXTRACTOR_PROMPT = `You extract a build plan from a chat message into strict JSON.
+
+Respond with ONLY a raw JSON object, no markdown fences, no preamble, no explanation. Match this exact shape:
+
+{
+  "projectName": "short project name, 2-5 words",
+  "steps": ["short imperative step", "short imperative step"]
+}
+
+Rules:
+- projectName names what's being built, not the word "plan" or "project" itself.
+- steps are 3-8 short imperative phrases (e.g. "Deploy staking contract to testnet"), each under 8 words, in the order they should be done.
+- If the message doesn't contain a clear buildable plan, extract your best-effort interpretation of the closest thing to a plan in it — never return anything except the JSON object.`;
 
 const COPILOT_SYSTEM_PROMPT = `You are Vibe Co-Pilot, the in-dashboard build assistant for VibeForge — a hackathon team shipping a decentralized builder-progress tracker on the Monad blockchain (Solidity contracts + a React/wagmi frontend + an LLM that parses messy notes into structured journal entries).
 
@@ -156,7 +174,7 @@ const DEFAULT_MESSAGES = [
   { role: "assistant", content: "Ask me anything about your code or architecture." },
 ];
 
-const DEFAULT_XP = 2400;
+const DEFAULT_XP = 0;
 const DEFAULT_NAME = "Toby";
 
 const STORAGE_KEYS = {
@@ -164,6 +182,8 @@ const STORAGE_KEYS = {
   totalXP: "vibeforge:total-xp",
   messages: "vibeforge:copilot-messages",
   profileName: "vibeforge:profile-name",
+  plans: "vibeforge:plans",
+  legacyActivePlan: "vibeforge:active-plan", // old single-plan key, read once for migration
 };
 
 /* ------------------------------------------------------------------ */
@@ -272,6 +292,10 @@ function DashboardView({
   isCapturing,
   captureError,
   onCapture,
+  isRecording,
+  speechError,
+  onToggleRecording,
+  activePlan,
   goTo,
 }) {
   return (
@@ -289,12 +313,20 @@ function DashboardView({
             <span className="vf-pill">+{totalXP.toLocaleString()} XP</span>
           </div>
           <p className="vf-t11 mb-4" style={{ color: "var(--text-2)" }}>
-            Type anything. Claude parses it into your build journal.
+            Type anything, or tap the mic to speak. Claude parses it into your build journal.
           </p>
 
           <div className="flex flex-col items-center py-3">
-            <div className="vf-orb mb-4">
-              <Mic size={26} color="var(--accent-light)" />
+            <button
+              type="button"
+              className={`vf-orb mb-2 ${isRecording ? "vf-orb-recording" : ""}`}
+              onClick={onToggleRecording}
+              aria-label={isRecording ? "Stop recording" : "Start voice capture"}
+            >
+              {isRecording ? <Square size={20} color="#f87171" /> : <Mic size={26} color="var(--accent-light)" />}
+            </button>
+            <div className="vf-t11 mb-2" style={{ color: isRecording ? "#f87171" : "var(--text-3)", minHeight: 14 }}>
+              {isRecording ? "● Recording — tap to stop" : speechError ? "Voice capture not supported in this browser" : ""}
             </div>
             <textarea
               className="vf-input vf-scrollbar mb-2"
@@ -335,7 +367,7 @@ function DashboardView({
           </div>
         </Card>
 
-        <ForgeGraphCard onExplore={() => goTo("forge")} />
+        <ForgeGraphCard onExplore={() => goTo("forge")} activePlan={activePlan} />
         <AnalyticsCard captures={captures} compact />
       </div>
 
@@ -389,19 +421,38 @@ function CaptureRow({ c }) {
 /*  PAGE: CAPTURE (full)                                                */
 /* ------------------------------------------------------------------ */
 
-function CaptureView({ captures, totalXP, captureText, setCaptureText, isCapturing, captureError, onCapture }) {
+function CaptureView({
+  captures,
+  totalXP,
+  captureText,
+  setCaptureText,
+  isCapturing,
+  captureError,
+  onCapture,
+  isRecording,
+  speechError,
+  onToggleRecording,
+}) {
   return (
     <>
       <PageHeader
         title="Vibe Capture"
-        subtitle="Dump anything. Claude turns it into a structured journal entry."
+        subtitle="Dump anything, or speak it. Claude turns it into a structured journal entry."
         right={<span className="vf-pill">+{totalXP.toLocaleString()} XP total</span>}
       />
       <div className="grid grid-cols-3 gap-4">
         <Card>
           <div className="flex flex-col items-center py-4">
-            <div className="vf-orb mb-4">
-              <Mic size={26} color="var(--accent-light)" />
+            <button
+              type="button"
+              className={`vf-orb mb-2 ${isRecording ? "vf-orb-recording" : ""}`}
+              onClick={onToggleRecording}
+              aria-label={isRecording ? "Stop recording" : "Start voice capture"}
+            >
+              {isRecording ? <Square size={20} color="#f87171" /> : <Mic size={26} color="var(--accent-light)" />}
+            </button>
+            <div className="vf-t11 mb-2" style={{ color: isRecording ? "#f87171" : "var(--text-3)", minHeight: 14 }}>
+              {isRecording ? "● Recording — tap to stop" : speechError ? "Voice capture not supported in this browser" : ""}
             </div>
             <textarea
               className="vf-input vf-scrollbar mb-2"
@@ -448,7 +499,22 @@ function CaptureView({ captures, totalXP, captureText, setCaptureText, isCapturi
 /*  PAGE: MY FORGE                                                      */
 /* ------------------------------------------------------------------ */
 
-function ForgeGraphCard({ onExplore, full }) {
+function ForgeGraphCard({ onExplore, full, activePlan }) {
+  const hasPlan = activePlan && activePlan.steps.length > 0;
+
+  const nodes = hasPlan
+    ? activePlan.steps.map((s, i) => ({
+        angle: -90 + (360 / activePlan.steps.length) * i,
+        done: s.status === "done",
+        top: s.status === "done" ? "✓ Done" : "Pending",
+        sub: s.label,
+      }))
+    : KNOWLEDGE_NODES.map((n) => ({ angle: n.angle, done: false, top: n.label, sub: n.sub }));
+
+  const centerLabel = hasPlan ? activePlan.projectName : "Staking DApp";
+  const doneCount = hasPlan ? activePlan.steps.filter((s) => s.status === "done").length : 0;
+  const nextPending = hasPlan ? activePlan.steps.find((s) => s.status === "pending") : null;
+
   return (
     <Card>
       <div className="flex items-center justify-between mb-3">
@@ -464,11 +530,21 @@ function ForgeGraphCard({ onExplore, full }) {
         style={{ aspectRatio: "1 / 1", maxWidth: full ? 360 : 280 }}
       >
         <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full">
-          {KNOWLEDGE_NODES.map((n, i) => {
+          {nodes.map((n, i) => {
             const rad = (n.angle * Math.PI) / 180;
             const x = 50 + 33 * Math.cos(rad);
             const y = 50 + 33 * Math.sin(rad);
-            return <line key={i} x1="50" y1="50" x2={x} y2={y} stroke="var(--border)" strokeWidth="0.6" />;
+            return (
+              <line
+                key={i}
+                x1="50"
+                y1="50"
+                x2={x}
+                y2={y}
+                stroke={n.done ? "var(--accent)" : "var(--border)"}
+                strokeWidth="0.6"
+              />
+            );
           })}
         </svg>
         <div
@@ -483,49 +559,122 @@ function ForgeGraphCard({ onExplore, full }) {
             padding: "10px 14px",
           }}
         >
-          Staking DApp
+          {centerLabel}
         </div>
-        {KNOWLEDGE_NODES.map((n, i) => {
+        {nodes.map((n, i) => {
           const rad = (n.angle * Math.PI) / 180;
           const x = 50 + 33 * Math.cos(rad);
           const y = 50 + 33 * Math.sin(rad);
           return (
-            <div key={i} className="vf-node" style={{ top: `${y}%`, left: `${x}%` }}>
-              <div style={{ fontWeight: 600 }}>{n.label}</div>
+            <div
+              key={i}
+              className="vf-node"
+              style={n.done ? { top: `${y}%`, left: `${x}%`, borderColor: "var(--green)" } : { top: `${y}%`, left: `${x}%` }}
+            >
+              <div style={{ fontWeight: 600, color: n.done ? "var(--green)" : "var(--text-1)" }}>{n.top}</div>
               <div style={{ color: "var(--text-3)" }}>{n.sub}</div>
             </div>
           );
         })}
       </div>
       <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
-        <div className="vf-t11 font-medium mb-1" style={{ color: "var(--accent-light)" }}>
-          AI Insight
-        </div>
-        <p className="text-xs" style={{ color: "var(--text-2)" }}>
-          You keep returning to on-chain reputation systems. This could be your signature project.
-        </p>
+        {hasPlan ? (
+          <>
+            <div className="vf-t11 font-medium mb-1" style={{ color: "var(--accent-light)" }}>
+              {doneCount} of {activePlan.steps.length} steps complete
+            </div>
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              {nextPending ? `Next up: ${nextPending.label}` : "All steps complete — nice work."}
+            </p>
+          </>
+        ) : (
+          <>
+            <div className="vf-t11 font-medium mb-1" style={{ color: "var(--accent-light)" }}>
+              No active plan yet
+            </div>
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              Ask Vibe Co-Pilot for a plan, then tap "Save as Forge plan" to see it here.
+            </p>
+          </>
+        )}
       </div>
     </Card>
   );
 }
 
-function ForgeView() {
+function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan }) {
+  const hasPlan = activePlan && activePlan.steps.length > 0;
   return (
     <>
-      <PageHeader title="My Forge" subtitle="Your personal knowledge graph." />
+      <PageHeader
+        title="My Forge"
+        subtitle={hasPlan ? `Your live plan for ${activePlan.projectName}.` : "Your personal knowledge graph."}
+      />
+      {plans.length > 0 && (
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
+          {plans.map((p) => {
+            const done = p.steps.filter((s) => s.status === "done").length;
+            const isActive = activePlan && p.id === activePlan.id;
+            return (
+              <div
+                key={p.id}
+                onClick={() => onSwitchPlan(p.id)}
+                className="flex items-center gap-2 rounded-full vf-t11"
+                style={{
+                  cursor: "pointer",
+                  padding: "6px 8px 6px 12px",
+                  background: isActive ? "var(--accent-dim)" : "var(--bg-surface-2)",
+                  border: `1px solid ${isActive ? "var(--accent)" : "var(--border)"}`,
+                  color: isActive ? "var(--accent-light)" : "var(--text-2)",
+                }}
+              >
+                <span style={{ fontWeight: isActive ? 600 : 500 }}>{p.projectName}</span>
+                <span style={{ color: "var(--text-3)" }}>
+                  {done}/{p.steps.length}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Delete ${p.projectName}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDeletePlan(p.id);
+                  }}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    padding: 2,
+                    cursor: "pointer",
+                    color: "var(--text-3)",
+                    display: "flex",
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
       <div className="grid grid-cols-3 gap-4">
         <div className="col-span-2">
-          <ForgeGraphCard full />
+          <ForgeGraphCard full activePlan={activePlan} />
         </div>
         <Card>
-          <div className="text-sm font-medium mb-3">Node Legend</div>
+          <div className="text-sm font-medium mb-3">{hasPlan ? "Steps" : "Node Legend"}</div>
           <div className="flex flex-col gap-2">
-            {KNOWLEDGE_NODES.map((n) => (
-              <div key={n.label} className="flex items-center justify-between vf-t11">
-                <span style={{ color: "var(--text-1)" }}>{n.label}</span>
-                <span style={{ color: "var(--text-3)" }}>{n.sub}</span>
-              </div>
-            ))}
+            {hasPlan
+              ? activePlan.steps.map((s) => (
+                  <div key={s.id} className="vf-t11" style={{ color: s.status === "done" ? "var(--green)" : "var(--text-1)" }}>
+                    {s.status === "done" ? "✓ " : "○ "}
+                    {s.label}
+                  </div>
+                ))
+              : KNOWLEDGE_NODES.map((n) => (
+                  <div key={n.label} className="flex items-center justify-between vf-t11">
+                    <span style={{ color: "var(--text-1)" }}>{n.label}</span>
+                    <span style={{ color: "var(--text-3)" }}>{n.sub}</span>
+                  </div>
+                ))}
           </div>
         </Card>
       </div>
@@ -672,7 +821,17 @@ function LearningView() {
 /*  PAGE: CO-PILOT                                                      */
 /* ------------------------------------------------------------------ */
 
-function ChatPanel({ messages, input, setInput, isLoading, onSend, height }) {
+function ChatPanel({
+  messages,
+  input,
+  setInput,
+  isLoading,
+  onSend,
+  height,
+  savingMessageIndex,
+  savedMessageIndices,
+  onSaveAsPlan,
+}) {
   const chatEndRef = useRef(null);
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -680,20 +839,59 @@ function ChatPanel({ messages, input, setInput, isLoading, onSend, height }) {
 
   return (
     <Card className="flex flex-col" style={{ height }}>
-      <div className="flex-1 overflow-y-auto vf-scrollbar flex flex-col gap-2 pr-1">
+      <div className="flex-1 overflow-y-auto vf-scrollbar flex flex-col gap-1 pr-1">
         {messages.map((m, i) => (
           <div
             key={i}
-            className="rounded-lg p-2.5 text-xs whitespace-pre-wrap"
             style={{
-              background: m.role === "user" ? "var(--accent-dim)" : "var(--bg-surface-2)",
-              border: "1px solid var(--border)",
-              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-              maxWidth: "85%",
-              color: m.role === "user" ? "var(--accent-light)" : "var(--text-1)",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: m.role === "user" ? "flex-end" : "flex-start",
             }}
           >
-            {m.content}
+            <div
+              className="rounded-lg p-2.5 text-xs whitespace-pre-wrap mb-1"
+              style={{
+                background: m.role === "user" ? "var(--accent-dim)" : "var(--bg-surface-2)",
+                border: "1px solid var(--border)",
+                maxWidth: "85%",
+                color: m.role === "user" ? "var(--accent-light)" : "var(--text-1)",
+              }}
+            >
+              {m.content}
+            </div>
+            {m.role === "assistant" && i > 0 && onSaveAsPlan && (
+              <button
+                type="button"
+                className="vf-t10 mb-2"
+                onClick={() => onSaveAsPlan(i, m.content)}
+                disabled={savingMessageIndex === i}
+                style={{
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  cursor: savingMessageIndex === i ? "default" : "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  color: savedMessageIndices?.has(i) ? "var(--green)" : "var(--accent-light)",
+                }}
+              >
+                {savingMessageIndex === i ? (
+                  <>
+                    <Loader2 size={11} className="animate-spin" /> Saving…
+                  </>
+                ) : savedMessageIndices?.has(i) ? (
+                  <>
+                    <CheckCircle2 size={11} /> Saved to My Forge
+                  </>
+                ) : (
+                  <>
+                    <LayoutGrid size={11} /> Save as Forge plan
+                  </>
+                )}
+              </button>
+            )}
           </div>
         ))}
         {isLoading && (
@@ -745,10 +943,10 @@ function CopilotPreviewCard({ onOpen }) {
   );
 }
 
-function CopilotView({ messages, input, setInput, isLoading, onSend }) {
+function CopilotView({ messages, input, setInput, isLoading, onSend, savingMessageIndex, savedMessageIndices, onSaveAsPlan }) {
   return (
     <>
-      <PageHeader title="Vibe Co-Pilot" subtitle="Your build assistant." />
+      <PageHeader title="Vibe Co-Pilot" subtitle="Your build assistant. Save any plan straight to My Forge." />
       <ChatPanel
         messages={messages}
         input={input}
@@ -756,6 +954,9 @@ function CopilotView({ messages, input, setInput, isLoading, onSend }) {
         isLoading={isLoading}
         onSend={onSend}
         height={560}
+        savingMessageIndex={savingMessageIndex}
+        savedMessageIndices={savedMessageIndices}
+        onSaveAsPlan={onSaveAsPlan}
       />
     </>
   );
@@ -1008,20 +1209,93 @@ export default function VibeForgeDashboard() {
   const [captures, setCaptures] = useState(DEFAULT_CAPTURES);
   const [totalXP, setTotalXP] = useState(DEFAULT_XP);
   const [captureError, setCaptureError] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [speechError, setSpeechError] = useState(false);
+  const recognitionRef = useRef(null);
 
   const [messages, setMessages] = useState(DEFAULT_MESSAGES);
   const [copilotInput, setCopilotInput] = useState("");
   const [isCopilotLoading, setIsCopilotLoading] = useState(false);
 
+  const [plans, setPlans] = useState([]);
+  const [activePlanId, setActivePlanId] = useState(null);
+  const activePlan = plans.find((p) => p.id === activePlanId) || null;
+  const [savingMessageIndex, setSavingMessageIndex] = useState(null);
+  const [savedMessageIndices, setSavedMessageIndices] = useState(() => new Set());
+
+  /* ---- stop any active recording if the component unmounts ---- */
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.stop();
+    };
+  }, []);
+
+  /* ---- voice capture via the browser's built-in speech recognition ---- */
+  function toggleRecording() {
+    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognitionAPI) {
+      setSpeechError(true);
+      return;
+    }
+
+    if (isRecording) {
+      recognitionRef.current?.stop();
+      return;
+    }
+
+    setSpeechError(false);
+    const recognition = new SpeechRecognitionAPI();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    const baseText = captureText.trim() ? captureText.trim() + " " : "";
+    let finalTranscript = "";
+
+    recognition.onresult = (event) => {
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript + " ";
+        } else {
+          interim += transcript;
+        }
+      }
+      setCaptureText((baseText + finalTranscript + interim).trim());
+    };
+
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+      setIsRecording(false);
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Could not start recording:", err);
+      setSpeechError(true);
+    }
+  }
+
   /* ---- load persisted data once on mount ---- */
   useEffect(() => {
     const startedAt = Date.now();
     (async () => {
-      const [capturesRaw, xpRaw, messagesRaw, nameRaw] = await Promise.all([
+      const [capturesRaw, xpRaw, messagesRaw, nameRaw, plansRaw, legacyPlanRaw] = await Promise.all([
         safeGet(STORAGE_KEYS.captures),
         safeGet(STORAGE_KEYS.totalXP),
         safeGet(STORAGE_KEYS.messages),
         safeGet(STORAGE_KEYS.profileName),
+        safeGet(STORAGE_KEYS.plans),
+        safeGet(STORAGE_KEYS.legacyActivePlan),
       ]);
       if (capturesRaw) {
         try {
@@ -1040,8 +1314,24 @@ export default function VibeForgeDashboard() {
       }
       if (nameRaw) setProfileName(nameRaw);
 
+      if (plansRaw) {
+        try {
+          const parsed = JSON.parse(plansRaw);
+          setPlans(Array.isArray(parsed.plans) ? parsed.plans : []);
+          setActivePlanId(parsed.activePlanId || null);
+        } catch (e) {}
+      } else if (legacyPlanRaw) {
+        // one-time migration from the old single-plan format
+        try {
+          const old = JSON.parse(legacyPlanRaw);
+          const migrated = { ...old, id: old.id || `plan-${Date.now()}` };
+          setPlans([migrated]);
+          setActivePlanId(migrated.id);
+        } catch (e) {}
+      }
+
       const elapsed = Date.now() - startedAt;
-      const MIN_SPLASH_MS = 3000;
+      const MIN_SPLASH_MS = 2000;
       if (elapsed < MIN_SPLASH_MS) {
         await new Promise((r) => setTimeout(r, MIN_SPLASH_MS - elapsed));
       }
@@ -1058,17 +1348,37 @@ export default function VibeForgeDashboard() {
       safeSet(STORAGE_KEYS.totalXP, JSON.stringify(totalXP)),
       safeSet(STORAGE_KEYS.messages, JSON.stringify(messages)),
       safeSet(STORAGE_KEYS.profileName, profileName),
+      safeSet(STORAGE_KEYS.plans, JSON.stringify({ plans, activePlanId })),
     ]).then((results) => {
       setSyncStatus(results.every(Boolean) ? "saved" : "error");
     });
-  }, [captures, totalXP, messages, profileName, isLoaded]);
+  }, [captures, totalXP, messages, profileName, plans, activePlanId, isLoaded]);
+
+  function findMatchingStepIndex(steps, matchedStep) {
+    if (!matchedStep) return -1;
+    const target = String(matchedStep).toLowerCase().trim();
+    let idx = steps.findIndex((s) => s.status === "pending" && s.label.toLowerCase().trim() === target);
+    if (idx !== -1) return idx;
+    idx = steps.findIndex(
+      (s) => s.status === "pending" && (s.label.toLowerCase().includes(target) || target.includes(s.label.toLowerCase()))
+    );
+    return idx;
+  }
+
+  function buildCaptureMessage(text, plan) {
+    const pending = plan ? plan.steps.filter((s) => s.status === "pending") : [];
+    if (pending.length === 0) return text;
+    const list = pending.map((s, i) => `${i + 1}. ${s.label}`).join("\n");
+    return `${text}\n\n---\nCurrent plan for "${plan.projectName}" — pending steps:\n${list}`;
+  }
 
   async function handleCapture() {
     if (!captureText.trim() || isCapturing) return;
+    if (isRecording) recognitionRef.current?.stop();
     setIsCapturing(true);
     setCaptureError(false);
     try {
-      const raw = await callClaude(VIBE_PARSER_PROMPT, captureText);
+      const raw = await callClaude(VIBE_PARSER_PROMPT, buildCaptureMessage(captureText, activePlan));
       const cleaned = raw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(cleaned);
       const entry = {
@@ -1083,6 +1393,19 @@ export default function VibeForgeDashboard() {
       setCaptures((prev) => [entry, ...prev]);
       setTotalXP((prev) => prev + entry.xpValue);
       setCaptureText("");
+
+      if (parsed.matchedStep && activePlan) {
+        setPlans((prev) =>
+          prev.map((p) => {
+            if (p.id !== activePlan.id) return p;
+            const idx = findMatchingStepIndex(p.steps, parsed.matchedStep);
+            if (idx === -1) return p;
+            const nextSteps = [...p.steps];
+            nextSteps[idx] = { ...nextSteps[idx], status: "done", linkedCaptureId: entry.id };
+            return { ...p, steps: nextSteps };
+          })
+        );
+      }
     } catch (err) {
       console.error("Vibe-Parser error:", err);
       setCaptureError(true);
@@ -1108,17 +1431,63 @@ export default function VibeForgeDashboard() {
     }
   }
 
+  async function handleSaveAsPlan(messageIndex, content) {
+    setSavingMessageIndex(messageIndex);
+    try {
+      const raw = await callClaude(PLAN_EXTRACTOR_PROMPT, content);
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      const steps = (Array.isArray(parsed.steps) ? parsed.steps : []).slice(0, 8).map((label, i) => ({
+        id: `step-${Date.now()}-${i}`,
+        label: String(label),
+        status: "pending",
+        linkedCaptureId: null,
+      }));
+      if (steps.length === 0) throw new Error("No steps extracted");
+      const newPlan = {
+        id: `plan-${Date.now()}`,
+        projectName: parsed.projectName || "Untitled Project",
+        steps,
+        createdAt: Date.now(),
+      };
+      setPlans((prev) => [newPlan, ...prev]);
+      setActivePlanId(newPlan.id);
+      setSavedMessageIndices((prev) => new Set(prev).add(messageIndex));
+    } catch (err) {
+      console.error("Failed to save plan:", err);
+    } finally {
+      setSavingMessageIndex(null);
+    }
+  }
+
+  function handleSwitchPlan(id) {
+    setActivePlanId(id);
+  }
+
+  function handleDeletePlan(id) {
+    const remaining = plans.filter((p) => p.id !== id);
+    setPlans(remaining);
+    if (activePlanId === id) {
+      setActivePlanId(remaining.length > 0 ? remaining[0].id : null);
+    }
+  }
+
   async function handleReset() {
     await Promise.all([
       safeDelete(STORAGE_KEYS.captures),
       safeDelete(STORAGE_KEYS.totalXP),
       safeDelete(STORAGE_KEYS.messages),
       safeDelete(STORAGE_KEYS.profileName),
+      safeDelete(STORAGE_KEYS.plans),
+      safeDelete(STORAGE_KEYS.legacyActivePlan),
     ]);
     setCaptures(DEFAULT_CAPTURES);
     setTotalXP(DEFAULT_XP);
     setMessages(DEFAULT_MESSAGES);
     setProfileName(DEFAULT_NAME);
+    setPlans([]);
+    setActivePlanId(null);
+    setSavedMessageIndices(new Set());
   }
 
   function renderPage() {
@@ -1134,11 +1503,22 @@ export default function VibeForgeDashboard() {
             isCapturing={isCapturing}
             captureError={captureError}
             onCapture={handleCapture}
+            isRecording={isRecording}
+            speechError={speechError}
+            onToggleRecording={toggleRecording}
+            activePlan={activePlan}
             goTo={setActiveNav}
           />
         );
       case "forge":
-        return <ForgeView />;
+        return (
+          <ForgeView
+            plans={plans}
+            activePlan={activePlan}
+            onSwitchPlan={handleSwitchPlan}
+            onDeletePlan={handleDeletePlan}
+          />
+        );
       case "capture":
         return (
           <CaptureView
@@ -1149,6 +1529,9 @@ export default function VibeForgeDashboard() {
             isCapturing={isCapturing}
             captureError={captureError}
             onCapture={handleCapture}
+            isRecording={isRecording}
+            speechError={speechError}
+            onToggleRecording={toggleRecording}
           />
         );
       case "projects":
@@ -1163,6 +1546,9 @@ export default function VibeForgeDashboard() {
             setInput={setCopilotInput}
             isLoading={isCopilotLoading}
             onSend={handleCopilotSend}
+            savingMessageIndex={savingMessageIndex}
+            savedMessageIndices={savedMessageIndices}
+            onSaveAsPlan={handleSaveAsPlan}
           />
         );
       case "onchain":
@@ -1278,15 +1664,28 @@ export default function VibeForgeDashboard() {
           height: 118px;
           border-radius: 50%;
           border: 1.5px solid var(--accent);
+          background: transparent;
+          padding: 0;
+          cursor: pointer;
           box-shadow: 0 0 32px var(--accent-dim), inset 0 0 24px var(--accent-dim);
           display: flex;
           align-items: center;
           justify-content: center;
           animation: vf-pulse 2.8s ease-in-out infinite;
+          transition: border-color 0.2s;
         }
+        .vf-orb:hover { border-color: var(--accent-light); }
         @keyframes vf-pulse {
           0%, 100% { box-shadow: 0 0 24px var(--accent-dim), inset 0 0 18px var(--accent-dim); }
           50% { box-shadow: 0 0 44px var(--accent-dim), inset 0 0 30px var(--accent-dim); }
+        }
+        .vf-orb-recording {
+          border-color: #f87171;
+          animation: vf-pulse-recording 1s ease-in-out infinite;
+        }
+        @keyframes vf-pulse-recording {
+          0%, 100% { box-shadow: 0 0 24px rgba(248,113,113,0.25), inset 0 0 18px rgba(248,113,113,0.25); }
+          50% { box-shadow: 0 0 50px rgba(248,113,113,0.45), inset 0 0 34px rgba(248,113,113,0.45); }
         }
         .vf-node {
           position: absolute;
