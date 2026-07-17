@@ -1,6 +1,9 @@
 import React from "react";
 import VibeForgeLogo from "./VibeForgeLogo";
 
+const WORD = "VibeForge";
+const VIBE_LEN = 4; // letters 0-3 are "Vibe", 4-8 are "Forge"
+
 export default function SplashScreen({ label = "Loading your forge…" }) {
   return (
     <div className="vf-splash">
@@ -28,31 +31,32 @@ export default function SplashScreen({ label = "Loading your forge…" }) {
           }
           4%, 8%, 46%, 71% { opacity: 0.35; filter: drop-shadow(0 0 2px rgba(124,92,252,0.2)); }
         }
-        .vf-splash-word {
-          display: inline-block;
+        .vf-splash-text {
+          display: inline-flex;
           overflow: hidden;
-          white-space: nowrap;
           max-width: 0;
+          animation: vf-grow 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.3s forwards;
+        }
+        @keyframes vf-grow { to { max-width: 260px; } }
+        .vf-letter {
+          display: inline-block;
           font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
           font-size: 32px;
           font-weight: 700;
           letter-spacing: -0.01em;
-          animation: vf-reveal-word 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+          opacity: 0;
+          transform: translateY(10px);
+          animation: vf-letter-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
-        .vf-splash-word-vibe {
-          color: #f5f5f7;
-          animation-delay: 0.65s;
-        }
-        .vf-splash-word-forge {
+        .vf-letter-vibe { color: #f5f5f7; }
+        .vf-letter-forge {
           background: linear-gradient(135deg, #7c5cfc, #a78bfa);
           -webkit-background-clip: text;
           background-clip: text;
           -webkit-text-fill-color: transparent;
-          animation-delay: 1.1s;
         }
-        @keyframes vf-reveal-word {
-          from { max-width: 0; }
-          to { max-width: 200px; }
+        @keyframes vf-letter-in {
+          to { opacity: 1; transform: translateY(0); }
         }
         .vf-splash-bar-track {
           position: relative; width: 220px; height: 4px;
@@ -77,8 +81,17 @@ export default function SplashScreen({ label = "Loading your forge…" }) {
       `}</style>
       <div className="vf-splash-lockup">
         <VibeForgeLogo size={56} className="vf-splash-logo" />
-        <span className="vf-splash-word vf-splash-word-vibe">Vibe</span>
-        <span className="vf-splash-word vf-splash-word-forge">Forge</span>
+        <span className="vf-splash-text">
+          {WORD.split("").map((ch, i) => (
+            <span
+              key={i}
+              className={`vf-letter ${i < VIBE_LEN ? "vf-letter-vibe" : "vf-letter-forge"}`}
+              style={{ animationDelay: `${0.4 + i * 0.05}s` }}
+            >
+              {ch}
+            </span>
+          ))}
+        </span>
       </div>
       <div className="vf-splash-bar-track"><div className="vf-splash-bar-fill" /></div>
       <div className="vf-splash-label">{label}</div>

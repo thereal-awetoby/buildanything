@@ -20,7 +20,17 @@ import {
   CloudOff,
   Square,
   X,
+  ImagePlus,
+  RefreshCw,
+  Sparkles,
 } from "lucide-react";
+import { useAccount, useConnect, useDisconnect, useWriteContract } from "wagmi";
+import { injected } from "wagmi/connectors";
+import { CONTRACT_ADDRESS, HEARTBEAT_ABI } from "./lib/contract";
+import { useHeartbeats } from "./hooks/useHeartbeats";
+import { useSoul } from "./hooks/useSoul";
+import { SOUL_CONTRACT_ADDRESS, SOUL_ABI } from "./lib/soulContract";
+import { supabase, loadCloudData, saveCloudData } from "./lib/supabase";
 import VibeForgeLogo from "./components/VibeForgeLogo";
 import {
   AreaChart,
@@ -48,7 +58,8 @@ Respond with ONLY a raw JSON object, no markdown fences, no preamble, no explana
   "openLoops": ["short phrase for each unresolved thread, 0-3 items"],
   "nextStep": "one concrete, immediately actionable next action",
   "xpValue": integer from 5 to 30 based on effort/impact implied by the note,
-  "matchedStep": "the exact text of a plan step (from the 'Current plan' list below the note, if present) that this capture completes, or null if none apply or no plan is listed"
+  "matchedStep": "the exact text of a plan step (from the 'Current plan' list below the note, if present) that this capture completes, or null if none apply or no plan is listed",
+  "lesson": "a short, specific thing the builder learned or figured out from this note, phrased as a standalone insight, or null if this note is just a routine status update with no real new understanding in it"
 }
 
 Rules:
@@ -58,6 +69,8 @@ Rules:
 - nextStep is a single next action, not a list.
 - xpValue: 5-10 for small/quick items, 11-20 for solid focused work, 21-30 for a shipped feature or hard unblock.
 - matchedStep must be copied EXACTLY, character-for-character, from the provided plan step list — never paraphrase it. Only set it if the note clearly indicates that step is now complete. When unsure, use null.
+- lesson should be null most of the time — only set it when the note describes solving a real problem, discovering how something works, or a technique worth remembering. Routine progress updates ("finished the button styling") don't count.
+- If a screenshot is attached, use what's actually visible in it (error messages, UI, code) as primary evidence for category/summary/lesson — don't just describe the image generically.
 - If the note is too vague to parse confidently, still return your best-effort JSON — never ask a clarifying question, never return anything but the JSON object.`;
 
 const PLAN_EXTRACTOR_PROMPT = `You extract a build plan from a chat message into strict JSON.
@@ -74,6 +87,18 @@ Rules:
 - steps are 3-8 short imperative phrases (e.g. "Deploy staking contract to testnet"), each under 8 words, in the order they should be done.
 - If the message doesn't contain a clear buildable plan, extract your best-effort interpretation of the closest thing to a plan in it — never return anything except the JSON object.`;
 
+const LESSON_EXTRACTOR_PROMPT = `You condense a chat reply into a single short lesson.
+
+Respond with ONLY a raw JSON object, no markdown fences, no preamble, no explanation. Match this exact shape:
+
+{
+  "lesson": "the single most useful, reusable insight or technique from the message, phrased as a standalone statement, under 15 words"
+}
+
+Rules:
+- Capture one specific, reusable takeaway, not a summary of the whole message.
+- If the message doesn't contain a clear technical insight, extract your best-effort interpretation of the closest thing to one — never return anything except the JSON object.`;
+
 const COPILOT_SYSTEM_PROMPT = `You are Vibe Co-Pilot, the in-dashboard build assistant for VibeForge — a hackathon team shipping a decentralized builder-progress tracker on the Monad blockchain (Solidity contracts + a React/wagmi frontend + an LLM that parses messy notes into structured journal entries).
 
 Answer like a sharp, fast teammate, not a customer support bot:
@@ -82,6 +107,55 @@ Answer like a sharp, fast teammate, not a customer support bot:
 - Default to Solidity/Foundry conventions for contract questions and React/wagmi/ethers.js conventions for frontend questions, unless told otherwise.
 - If a suggestion trades off gas, security, or time-to-ship, name the tradeoff in one short line — don't lecture.
 - No filler like "Great question!" — just answer.`;
+
+// Builds the system prompt fresh each call, injecting the builder's real
+// recent activity so Co-Pilot's answers can be genuinely personalized —
+// not a generic assistant with no memory of what they're actually building.
+function buildCopilotSystemPrompt(captures, activePlan, lessons) {
+  const recentCaptures = captures
+    .slice(0, 5)
+    .map((c) => `- [${c.category}] ${c.summary}`)
+    .join("\n");
+
+  const planLine = activePlan
+    ? `Active project: "${activePlan.projectName}" — ${
+        activePlan.steps.filter((s) => s.status === "done").length
+      }/${activePlan.steps.length} steps done. Pending: ${
+        activePlan.steps.filter((s) => s.status === "pending").map((s) => s.label).join(", ") || "none"
+      }.`
+    : "No active project plan right now.";
+
+  const lessonLines = lessons
+    .slice(0, 3)
+    .map((l) => `- ${l.title}`)
+    .join("\n");
+
+  return `${COPILOT_SYSTEM_PROMPT}
+
+Here is this builder's real recent context. Use it to personalize your answer when it's actually relevant (e.g. referencing what they're building) — don't recite it back to them or force it in when it doesn't help.
+
+Recent captures:
+${recentCaptures || "None yet."}
+
+${planLine}
+
+Recent lessons learned:
+${lessonLines || "None yet."}`;
+}
+
+const DAILY_PULSE_PROMPT = `You write a short, warm "Daily Pulse" summary for a builder, based on their real activity in the last day.
+
+Respond with ONLY a raw JSON object, no markdown fences, no preamble, no explanation. Match this exact shape:
+
+{
+  "summary": "a warm, specific 2-3 sentence recap written directly to them ('You...'), mentioning at least one real specific thing from their activity — never generic filler"
+}
+
+Rules:
+- Reference specific things from the captures/lessons given — never say something so generic it could apply to anyone.
+- Keep it under 50 words.
+- Encouraging tone, not corporate, not over-the-top.
+- Never invent activity that wasn't given to you.`;
 
 /* ------------------------------------------------------------------ */
 /*  NAV                                                                 */
@@ -107,12 +181,6 @@ const PROJECTS = [
   { name: "Staking DApp", desc: "A decentralized staking platform built on Monad.", progress: 60 },
   { name: "NFT Reputation System", desc: "Soulbound reputation for builders on-chain.", progress: 30 },
   { name: "On-Chain Journal", desc: "Personal on-chain knowledge and progress tracker.", progress: 80 },
-];
-
-const ON_CHAIN_ACTIVITY = [
-  { label: "Minted: Daily Progress #12", sub: "NFT", time: "2h ago" },
-  { label: "Earned: Smart Contract Badge", sub: "SBT", time: "1d ago" },
-  { label: "Minted: Project Milestone", sub: "Staking DApp — v0.1", time: "2d ago" },
 ];
 
 const ANALYTICS_DATA = [
@@ -141,13 +209,18 @@ const KNOWLEDGE_NODES = [
   { label: "Artifact", sub: "Staking Module", angle: 210 },
 ];
 
-const MOCK_LESSONS = [
-  { title: "Intro to Monad Parallel EVM", status: "Completed", badge: "Foundations" },
-  { title: "Wallet Auth & Sessions", status: "Completed", badge: "Security" },
-  { title: "Smart Contract Basics", status: "Completed", badge: "Contracts" },
-  { title: "Gas Optimization Patterns", status: "In Progress", badge: "Contracts" },
-  { title: "Building With Wagmi", status: "Not Started", badge: "Frontend" },
-];
+function computeBadges(lessons, plans) {
+  const badges = [];
+  if (lessons.length >= 1) badges.push({ id: "first-lesson", label: "First Lesson" });
+  if (lessons.length >= 5) badges.push({ id: "quick-learner", label: "Quick Learner — 5 lessons" });
+  if (lessons.length >= 15) badges.push({ id: "knowledge-builder", label: "Knowledge Builder — 15 lessons" });
+  plans.forEach((p) => {
+    if (p.steps.length > 0 && p.steps.every((s) => s.status === "done")) {
+      badges.push({ id: `shipped-${p.id}`, label: `Shipped: ${p.projectName}` });
+    }
+  });
+  return badges;
+}
 
 const DEFAULT_CAPTURES = [
   {
@@ -183,6 +256,8 @@ const STORAGE_KEYS = {
   messages: "vibeforge:copilot-messages",
   profileName: "vibeforge:profile-name",
   plans: "vibeforge:plans",
+  lessons: "vibeforge:lessons",
+  dailyPulse: "vibeforge:daily-pulse",
   legacyActivePlan: "vibeforge:active-plan", // old single-plan key, read once for migration
 };
 
@@ -190,18 +265,19 @@ const STORAGE_KEYS = {
 /*  API + STORAGE HELPERS                                              */
 /* ------------------------------------------------------------------ */
 
-async function callClaude(system, userText) {
+async function callAI(system, userText, image = null) {
   // Calls our own Express server (server/index.js), which holds the real
-  // OpenAI API key and forwards the request — the key never reaches
+  // Gemini API key and forwards the request — the key never reaches
   // the browser. In dev, Vite proxies /api to http://localhost:3001.
-  const res = await fetch("/api/claude", {
+  // `image`, if provided, is a data URL string (e.g. "data:image/png;base64,...").
+  const res = await fetch("/api/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, message: userText }),
+    body: JSON.stringify({ system, message: userText, image }),
   });
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data?.error ? JSON.stringify(data.error) : "Claude API request failed");
+    throw new Error(data?.error ? JSON.stringify(data.error) : "AI request failed");
   }
   return data.text || "";
 }
@@ -265,7 +341,7 @@ function PageHeader({ title, subtitle, right }) {
   );
 }
 
-function StreakBadge() {
+function StreakBadge({ days }) {
   return (
     <Card className="flex items-center gap-3" style={{ padding: "10px 16px" }}>
       <Flame size={18} color="#fb923c" />
@@ -273,7 +349,7 @@ function StreakBadge() {
         <div className="vf-t10" style={{ color: "var(--text-3)" }}>
           Build Streak
         </div>
-        <div className="text-lg font-semibold leading-none">12 days</div>
+        <div className="text-lg font-semibold leading-none">{days} days</div>
       </div>
     </Card>
   );
@@ -282,6 +358,135 @@ function StreakBadge() {
 /* ------------------------------------------------------------------ */
 /*  PAGE: DASHBOARD (overview)                                          */
 /* ------------------------------------------------------------------ */
+
+function ImageAttachRow({ attachedImage, onFileSelect, onRemoveImage }) {
+  const fileInputRef = useRef(null);
+  return (
+    <div className="w-full mb-2">
+      {attachedImage && (
+        <div className="mb-2" style={{ position: "relative", display: "inline-block" }}>
+          <img
+            src={attachedImage}
+            alt="Attached screenshot"
+            style={{ maxHeight: 80, borderRadius: 8, border: "1px solid var(--border)" }}
+          />
+          <button
+            type="button"
+            onClick={onRemoveImage}
+            aria-label="Remove attached image"
+            style={{
+              position: "absolute",
+              top: -6,
+              right: -6,
+              background: "var(--bg-surface-2)",
+              border: "1px solid var(--border)",
+              borderRadius: "50%",
+              width: 18,
+              height: 18,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              padding: 0,
+            }}
+          >
+            <X size={10} color="var(--text-2)" />
+          </button>
+        </div>
+      )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) onFileSelect(file);
+          e.target.value = "";
+        }}
+      />
+      <button
+        type="button"
+        className="vf-t10"
+        onClick={() => fileInputRef.current?.click()}
+        style={{
+          background: "none",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          color: "var(--accent-light)",
+        }}
+      >
+        <ImagePlus size={12} /> {attachedImage ? "Change screenshot" : "Attach screenshot (or paste)"}
+      </button>
+    </div>
+  );
+}
+
+function DailyPulseCard({ pulse, isGenerating, onRefresh }) {
+  return (
+    <Card className="mb-4">
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-2 mb-2">
+          <Sparkles size={15} color="var(--accent-light)" />
+          <h2 className="text-base font-semibold">Daily Pulse</h2>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={isGenerating}
+          aria-label="Refresh Daily Pulse"
+          style={{
+            background: "none",
+            border: "none",
+            padding: 0,
+            cursor: isGenerating ? "default" : "pointer",
+            color: "var(--text-3)",
+            display: "flex",
+          }}
+        >
+          <RefreshCw size={13} className={isGenerating ? "animate-spin" : ""} />
+        </button>
+      </div>
+      {isGenerating ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          Putting your pulse together…
+        </p>
+      ) : pulse?.summary ? (
+        <>
+          <p className="text-xs mb-3" style={{ color: "var(--text-1)" }}>
+            {pulse.summary}
+          </p>
+          {pulse.openLoops?.length > 0 && (
+            <div className="flex flex-wrap gap-1 mb-2">
+              {pulse.openLoops.map((loop, i) => (
+                <span
+                  key={i}
+                  className="vf-t10 rounded-full px-2 py-0.5"
+                  style={{ background: "var(--bg-surface-2)", color: "var(--text-3)" }}
+                >
+                  {loop}
+                </span>
+              ))}
+            </div>
+          )}
+          {pulse.nextAction && (
+            <p className="vf-t11" style={{ color: "var(--accent-light)" }}>
+              Next tiny step: {pulse.nextAction}
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          Do a Vibe Capture and your morning pulse will show up here.
+        </p>
+      )}
+    </Card>
+  );
+}
 
 function DashboardView({
   profileName,
@@ -296,6 +501,18 @@ function DashboardView({
   speechError,
   onToggleRecording,
   activePlan,
+  isConnected,
+  isLoadingChain,
+  streak,
+  heartbeats,
+  lessons,
+  attachedImage,
+  onImageSelect,
+  onRemoveImage,
+  onImagePaste,
+  dailyPulse,
+  isGeneratingPulse,
+  onRefreshPulse,
   goTo,
 }) {
   return (
@@ -303,8 +520,10 @@ function DashboardView({
       <PageHeader
         title={`Good morning, ${profileName}.`}
         subtitle="Here's your builder pulse for today."
-        right={<StreakBadge />}
+        right={<StreakBadge days={streak} />}
       />
+
+      <DailyPulseCard pulse={dailyPulse} isGenerating={isGeneratingPulse} onRefresh={onRefreshPulse} />
 
       <div className="grid grid-cols-3 gap-4 mb-4">
         <Card>
@@ -334,7 +553,9 @@ function DashboardView({
               placeholder="e.g. finally fixed the gas issue in the staking loop..."
               value={captureText}
               onChange={(e) => setCaptureText(e.target.value)}
+              onPaste={onImagePaste}
             />
+            <ImageAttachRow attachedImage={attachedImage} onFileSelect={onImageSelect} onRemoveImage={onRemoveImage} />
             <button
               className="vf-btn-primary w-full justify-center"
               onClick={onCapture}
@@ -367,17 +588,34 @@ function DashboardView({
           </div>
         </Card>
 
-        <ForgeGraphCard onExplore={() => goTo("forge")} activePlan={activePlan} />
+        <ForgeGraphCard onExplore={() => goTo("forge")} activePlan={activePlan} lessons={lessons} captures={captures} />
         <AnalyticsCard captures={captures} compact />
       </div>
 
       <div className="grid grid-cols-3 gap-4">
         <ProjectsCard onViewAll={() => goTo("projects")} />
         <CopilotPreviewCard onOpen={() => goTo("copilot")} />
-        <OnChainCard onViewAll={() => goTo("onchain")} />
+        <OnChainCard
+          onViewAll={() => goTo("onchain")}
+          isConnected={isConnected}
+          isLoadingChain={isLoadingChain}
+          streak={streak}
+          heartbeats={heartbeats}
+        />
       </div>
     </>
   );
+}
+
+function formatRelativeTime(timestamp) {
+  const diffMs = Date.now() - timestamp;
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 function CaptureRow({ c }) {
@@ -389,7 +627,7 @@ function CaptureRow({ c }) {
       <div className="flex items-center justify-between mb-1">
         <CategoryPill category={c.category} />
         <span className="vf-t10" style={{ color: "var(--text-3)" }}>
-          {c.time}
+          {c.createdAt ? formatRelativeTime(c.createdAt) : c.time}
         </span>
       </div>
       <div className="text-xs" style={{ color: "var(--text-1)" }}>
@@ -432,12 +670,16 @@ function CaptureView({
   isRecording,
   speechError,
   onToggleRecording,
+  attachedImage,
+  onImageSelect,
+  onRemoveImage,
+  onImagePaste,
 }) {
   return (
     <>
       <PageHeader
         title="Vibe Capture"
-        subtitle="Dump anything, or speak it. Claude turns it into a structured journal entry."
+        subtitle="Dump anything, speak it, or paste a screenshot. Claude turns it into a structured journal entry."
         right={<span className="vf-pill">+{totalXP.toLocaleString()} XP total</span>}
       />
       <div className="grid grid-cols-3 gap-4">
@@ -460,7 +702,9 @@ function CaptureView({
               placeholder="e.g. finally fixed the gas issue in the staking loop, still need to wire up the frontend event listener..."
               value={captureText}
               onChange={(e) => setCaptureText(e.target.value)}
+              onPaste={onImagePaste}
             />
+            <ImageAttachRow attachedImage={attachedImage} onFileSelect={onImageSelect} onRemoveImage={onRemoveImage} />
             <button
               className="vf-btn-primary w-full justify-center"
               onClick={onCapture}
@@ -499,19 +743,45 @@ function CaptureView({
 /*  PAGE: MY FORGE                                                      */
 /* ------------------------------------------------------------------ */
 
-function ForgeGraphCard({ onExplore, full, activePlan }) {
+function mostFrequentCategory(items) {
+  const counts = {};
+  items.forEach((i) => {
+    counts[i.category] = (counts[i.category] || 0) + 1;
+  });
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  return entries.length ? entries[0][0] : null;
+}
+
+function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = [] }) {
   const hasPlan = activePlan && activePlan.steps.length > 0;
+  const knowledgeSource = lessons.length > 0 ? lessons : captures;
+  const hasKnowledge = !hasPlan && knowledgeSource.length > 0;
 
-  const nodes = hasPlan
-    ? activePlan.steps.map((s, i) => ({
-        angle: -90 + (360 / activePlan.steps.length) * i,
-        done: s.status === "done",
-        top: s.status === "done" ? "✓ Done" : "Pending",
-        sub: s.label,
-      }))
-    : KNOWLEDGE_NODES.map((n) => ({ angle: n.angle, done: false, top: n.label, sub: n.sub }));
+  let nodes;
+  let centerLabel;
 
-  const centerLabel = hasPlan ? activePlan.projectName : "Staking DApp";
+  if (hasPlan) {
+    nodes = activePlan.steps.map((s, i) => ({
+      angle: -90 + (360 / activePlan.steps.length) * i,
+      done: s.status === "done",
+      top: s.status === "done" ? "✓ Done" : "Pending",
+      sub: s.label,
+    }));
+    centerLabel = activePlan.projectName;
+  } else if (hasKnowledge) {
+    const items = knowledgeSource.slice(0, 6);
+    nodes = items.map((item, i) => ({
+      angle: -90 + (360 / items.length) * i,
+      done: false,
+      top: item.category,
+      sub: item.title || item.summary,
+    }));
+    centerLabel = mostFrequentCategory(captures) ? `Your ${mostFrequentCategory(captures)} Work` : "Your Knowledge";
+  } else {
+    nodes = KNOWLEDGE_NODES.map((n) => ({ angle: n.angle, done: false, top: n.label, sub: n.sub }));
+    centerLabel = "Staking DApp";
+  }
+
   const doneCount = hasPlan ? activePlan.steps.filter((s) => s.status === "done").length : 0;
   const nextPending = hasPlan ? activePlan.steps.find((s) => s.status === "pending") : null;
 
@@ -587,13 +857,22 @@ function ForgeGraphCard({ onExplore, full, activePlan }) {
               {nextPending ? `Next up: ${nextPending.label}` : "All steps complete — nice work."}
             </p>
           </>
+        ) : hasKnowledge ? (
+          <>
+            <div className="vf-t11 font-medium mb-1" style={{ color: "var(--accent-light)" }}>
+              Your recent knowledge
+            </div>
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              Ask Vibe Co-Pilot for a plan to turn this into a tracked project.
+            </p>
+          </>
         ) : (
           <>
             <div className="vf-t11 font-medium mb-1" style={{ color: "var(--accent-light)" }}>
-              No active plan yet
+              No activity yet
             </div>
             <p className="text-xs" style={{ color: "var(--text-2)" }}>
-              Ask Vibe Co-Pilot for a plan, then tap "Save as Forge plan" to see it here.
+              Do a Vibe Capture or ask Co-Pilot for a plan to see your real Forge here.
             </p>
           </>
         )}
@@ -602,7 +881,7 @@ function ForgeGraphCard({ onExplore, full, activePlan }) {
   );
 }
 
-function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan }) {
+function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan, lessons, captures }) {
   const hasPlan = activePlan && activePlan.steps.length > 0;
   return (
     <>
@@ -657,16 +936,25 @@ function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan }) {
       )}
       <div className="grid grid-cols-3 gap-4">
         <div className="col-span-2">
-          <ForgeGraphCard full activePlan={activePlan} />
+          <ForgeGraphCard full activePlan={activePlan} lessons={lessons} captures={captures} />
         </div>
         <Card>
-          <div className="text-sm font-medium mb-3">{hasPlan ? "Steps" : "Node Legend"}</div>
+          <div className="text-sm font-medium mb-3">
+            {hasPlan ? "Steps" : lessons.length > 0 ? "Recent Lessons" : "Node Legend"}
+          </div>
           <div className="flex flex-col gap-2">
             {hasPlan
               ? activePlan.steps.map((s) => (
                   <div key={s.id} className="vf-t11" style={{ color: s.status === "done" ? "var(--green)" : "var(--text-1)" }}>
                     {s.status === "done" ? "✓ " : "○ "}
                     {s.label}
+                  </div>
+                ))
+              : lessons.length > 0
+              ? lessons.slice(0, 6).map((l) => (
+                  <div key={l.id} className="flex items-center justify-between vf-t11">
+                    <span style={{ color: "var(--text-1)" }}>{l.title}</span>
+                    <CategoryPill category={l.category} />
                   </div>
                 ))
               : KNOWLEDGE_NODES.map((n) => (
@@ -741,78 +1029,75 @@ function ProjectsView() {
 /*  PAGE: LEARNING (BuildAnything sync — mocked per Phase 4)            */
 /* ------------------------------------------------------------------ */
 
-function LearningView() {
-  const completed = MOCK_LESSONS.filter((l) => l.status === "Completed").length;
+function LearningView({ lessons, plans }) {
+  const badges = computeBadges(lessons, plans);
   return (
     <>
       <PageHeader
         title="Learning"
-        subtitle="Synced from your Build Anything profile."
-        right={
-          <button className="vf-btn-primary">
-            <Plus size={13} /> Import profile
-          </button>
-        }
+        subtitle="Lessons and badges, captured automatically as you build."
       />
       <Card className="mb-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium">Build Anything progress</div>
-            <div className="vf-t11" style={{ color: "var(--text-3)" }}>
-              {completed} of {MOCK_LESSONS.length} lessons completed
-            </div>
-          </div>
-          <div
-            className="rounded-full"
-            style={{ height: 6, width: 200, background: "var(--bg-surface-2)" }}
-          >
-            <div
-              className="rounded-full"
-              style={{
-                height: 6,
-                width: `${(completed / MOCK_LESSONS.length) * 100}%`,
-                background: "var(--accent)",
-              }}
-            />
-          </div>
+        <div className="text-sm font-medium">Your learning log</div>
+        <div className="vf-t11" style={{ color: "var(--text-3)" }}>
+          {lessons.length} lesson{lessons.length === 1 ? "" : "s"} captured · {badges.length} badge
+          {badges.length === 1 ? "" : "s"} earned
         </div>
       </Card>
-      <Card>
-        <div className="text-sm font-medium mb-3">Lessons & Badges</div>
-        <div className="flex flex-col gap-2">
-          {MOCK_LESSONS.map((l) => (
-            <div
-              key={l.title}
-              className="flex items-center justify-between rounded-lg p-3"
-              style={{ background: "var(--bg-surface-2)", border: "1px solid var(--border)" }}
-            >
-              <div className="flex items-center gap-2">
-                {l.status === "Completed" ? (
-                  <CheckCircle2 size={15} color="var(--green)" />
-                ) : (
-                  <div
-                    className="rounded-full"
-                    style={{
-                      width: 15,
-                      height: 15,
-                      border: "1.5px solid var(--text-3)",
-                    }}
-                  />
-                )}
-                <div>
+      <div className="grid grid-cols-3 gap-4">
+        <Card className="col-span-2">
+          <div className="text-sm font-medium mb-3">Lessons</div>
+          {lessons.length === 0 ? (
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              No lessons yet. Lessons are captured automatically when a Vibe Capture reflects
+              something you actually figured out — or save one from a useful Co-Pilot reply.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2 overflow-y-auto vf-scrollbar pr-1" style={{ maxHeight: 480 }}>
+              {lessons.map((l) => (
+                <div
+                  key={l.id}
+                  className="rounded-lg p-3"
+                  style={{ background: "var(--bg-surface-2)", border: "1px solid var(--border)" }}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <CategoryPill category={l.category} />
+                    <span className="vf-t10" style={{ color: "var(--text-3)" }}>
+                      {new Date(l.capturedAt).toLocaleDateString()}
+                    </span>
+                  </div>
                   <div className="text-xs" style={{ color: "var(--text-1)" }}>
                     {l.title}
                   </div>
-                  <div className="vf-t10" style={{ color: "var(--text-3)" }}>
-                    {l.status}
-                  </div>
                 </div>
-              </div>
-              <CategoryPill category={l.badge} />
+              ))}
             </div>
-          ))}
-        </div>
-      </Card>
+          )}
+        </Card>
+        <Card>
+          <div className="text-sm font-medium mb-3">Badges</div>
+          {badges.length === 0 ? (
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              Badges unlock as you learn and ship. Nothing yet — keep building.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {badges.map((b) => (
+                <div
+                  key={b.id}
+                  className="flex items-center gap-2 rounded-lg p-2.5"
+                  style={{ background: "var(--bg-surface-2)", border: "1px solid var(--border)" }}
+                >
+                  <CheckCircle2 size={14} color="var(--green)" />
+                  <span className="vf-t11" style={{ color: "var(--text-1)" }}>
+                    {b.label}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
     </>
   );
 }
@@ -831,6 +1116,9 @@ function ChatPanel({
   savingMessageIndex,
   savedMessageIndices,
   onSaveAsPlan,
+  savingLessonIndex,
+  savedLessonIndices,
+  onSaveAsLesson,
 }) {
   const chatEndRef = useRef(null);
   useEffect(() => {
@@ -860,37 +1148,73 @@ function ChatPanel({
             >
               {m.content}
             </div>
-            {m.role === "assistant" && i > 0 && onSaveAsPlan && (
-              <button
-                type="button"
-                className="vf-t10 mb-2"
-                onClick={() => onSaveAsPlan(i, m.content)}
-                disabled={savingMessageIndex === i}
-                style={{
-                  background: "none",
-                  border: "none",
-                  padding: 0,
-                  cursor: savingMessageIndex === i ? "default" : "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 4,
-                  color: savedMessageIndices?.has(i) ? "var(--green)" : "var(--accent-light)",
-                }}
-              >
-                {savingMessageIndex === i ? (
-                  <>
-                    <Loader2 size={11} className="animate-spin" /> Saving…
-                  </>
-                ) : savedMessageIndices?.has(i) ? (
-                  <>
-                    <CheckCircle2 size={11} /> Saved to My Forge
-                  </>
-                ) : (
-                  <>
-                    <LayoutGrid size={11} /> Save as Forge plan
-                  </>
+            {m.role === "assistant" && i > 0 && (onSaveAsPlan || onSaveAsLesson) && (
+              <div className="flex items-center gap-3 mb-2">
+                {onSaveAsPlan && (
+                  <button
+                    type="button"
+                    className="vf-t10"
+                    onClick={() => onSaveAsPlan(i, m.content)}
+                    disabled={savingMessageIndex === i}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      padding: 0,
+                      cursor: savingMessageIndex === i ? "default" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      color: savedMessageIndices?.has(i) ? "var(--green)" : "var(--accent-light)",
+                    }}
+                  >
+                    {savingMessageIndex === i ? (
+                      <>
+                        <Loader2 size={11} className="animate-spin" /> Saving…
+                      </>
+                    ) : savedMessageIndices?.has(i) ? (
+                      <>
+                        <CheckCircle2 size={11} /> Saved to My Forge
+                      </>
+                    ) : (
+                      <>
+                        <LayoutGrid size={11} /> Save as Forge plan
+                      </>
+                    )}
+                  </button>
                 )}
-              </button>
+                {onSaveAsLesson && (
+                  <button
+                    type="button"
+                    className="vf-t10"
+                    onClick={() => onSaveAsLesson(i, m.content)}
+                    disabled={savingLessonIndex === i}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      padding: 0,
+                      cursor: savingLessonIndex === i ? "default" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      color: savedLessonIndices?.has(i) ? "var(--green)" : "var(--accent-light)",
+                    }}
+                  >
+                    {savingLessonIndex === i ? (
+                      <>
+                        <Loader2 size={11} className="animate-spin" /> Saving…
+                      </>
+                    ) : savedLessonIndices?.has(i) ? (
+                      <>
+                        <CheckCircle2 size={11} /> Saved to Learning
+                      </>
+                    ) : (
+                      <>
+                        <BookOpen size={11} /> Save as Lesson
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
             )}
           </div>
         ))}
@@ -943,10 +1267,22 @@ function CopilotPreviewCard({ onOpen }) {
   );
 }
 
-function CopilotView({ messages, input, setInput, isLoading, onSend, savingMessageIndex, savedMessageIndices, onSaveAsPlan }) {
+function CopilotView({
+  messages,
+  input,
+  setInput,
+  isLoading,
+  onSend,
+  savingMessageIndex,
+  savedMessageIndices,
+  onSaveAsPlan,
+  savingLessonIndex,
+  savedLessonIndices,
+  onSaveAsLesson,
+}) {
   return (
     <>
-      <PageHeader title="Vibe Co-Pilot" subtitle="Your build assistant. Save any plan straight to My Forge." />
+      <PageHeader title="Vibe Co-Pilot" subtitle="Your build assistant. Save any plan or lesson worth keeping." />
       <ChatPanel
         messages={messages}
         input={input}
@@ -957,6 +1293,9 @@ function CopilotView({ messages, input, setInput, isLoading, onSend, savingMessa
         savingMessageIndex={savingMessageIndex}
         savedMessageIndices={savedMessageIndices}
         onSaveAsPlan={onSaveAsPlan}
+        savingLessonIndex={savingLessonIndex}
+        savedLessonIndices={savedLessonIndices}
+        onSaveAsLesson={onSaveAsLesson}
       />
     </>
   );
@@ -966,7 +1305,7 @@ function CopilotView({ messages, input, setInput, isLoading, onSend, savingMessa
 /*  PAGE: ON-CHAIN                                                      */
 /* ------------------------------------------------------------------ */
 
-function OnChainCard({ onViewAll, full }) {
+function OnChainCard({ onViewAll, full, isConnected, isLoadingChain, streak, heartbeats }) {
   return (
     <Card>
       <div className="flex items-center justify-between mb-1">
@@ -983,46 +1322,115 @@ function OnChainCard({ onViewAll, full }) {
       <div className="flex items-center gap-3 mb-4">
         <Flame size={30} color="var(--accent-light)" />
         <div>
-          <div className="text-2xl font-semibold leading-none">12 days</div>
+          <div className="text-2xl font-semibold leading-none">{streak} days</div>
           <div className="vf-t11 mt-1" style={{ color: "var(--text-3)" }}>
-            Keep building to extend your streak.
+            {isConnected ? "Keep building to extend your streak." : "Connect your wallet to see your real streak."}
           </div>
         </div>
       </div>
       <div className="text-xs font-medium mb-2">Recent On-Chain Activity</div>
       <div className="flex flex-col gap-2 mb-3">
-        {ON_CHAIN_ACTIVITY.map((a) => (
-          <div key={a.label} className="flex items-center justify-between vf-t11">
+        {!isConnected && (
+          <p className="vf-t11" style={{ color: "var(--text-3)" }}>
+            Connect your wallet to load your on-chain heartbeats.
+          </p>
+        )}
+        {isConnected && isLoadingChain && (
+          <p className="vf-t11" style={{ color: "var(--text-3)" }}>
+            Loading from Monad Testnet…
+          </p>
+        )}
+        {isConnected && !isLoadingChain && heartbeats.length === 0 && (
+          <p className="vf-t11" style={{ color: "var(--text-3)" }}>
+            No heartbeats logged yet — do a capture to mint your first one.
+          </p>
+        )}
+        {heartbeats.slice(0, 5).map((h, i) => (
+          <div key={i} className="flex items-center justify-between vf-t11">
             <div className="flex items-center gap-2">
               <CheckCircle2 size={13} color="var(--green)" />
               <div>
-                <div style={{ color: "var(--text-1)" }}>{a.label}</div>
-                <div style={{ color: "var(--text-3)" }}>{a.sub}</div>
+                <div style={{ color: "var(--text-1)" }}>{h.summary}</div>
+                <div style={{ color: "var(--text-3)" }}>
+                  {h.category} · +{h.xpReward} XP
+                </div>
               </div>
             </div>
-            <span style={{ color: "var(--text-3)" }}>{a.time}</span>
+            <span style={{ color: "var(--text-3)" }}>{new Date(h.timestamp).toLocaleDateString()}</span>
           </div>
         ))}
       </div>
-      <button
+      <a
+        href="https://testnet.monadexplorer.com"
+        target="_blank"
+        rel="noreferrer"
         className="vf-btn-primary w-full justify-center"
-        style={{ background: "var(--bg-surface-2)", color: "var(--text-2)" }}
+        style={{ background: "var(--bg-surface-2)", color: "var(--text-2)", textDecoration: "none" }}
       >
         View all on Monad Explorer <ExternalLink size={12} />
-      </button>
+      </a>
     </Card>
   );
 }
 
-function OnChainView() {
+function SoulCard({ isConnected, isLoadingSoul, soul }) {
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-base font-semibold">Builder Soul</h2>
+      </div>
+      {!SOUL_CONTRACT_ADDRESS ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          No VITE_SOUL_CONTRACT_ADDRESS set yet — add it to .env once the Soul contract is deployed.
+        </p>
+      ) : !isConnected ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          Connect your wallet to see your Soul.
+        </p>
+      ) : isLoadingSoul ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          Loading from Monad Testnet…
+        </p>
+      ) : !soul ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          No Soul minted yet — your first Capture with a connected wallet mints one automatically.
+        </p>
+      ) : (
+        <>
+          <img
+            src={soul.imageDataUri}
+            alt={soul.name}
+            style={{ width: "100%", borderRadius: 12, border: "1px solid var(--border)" }}
+          />
+          <div className="mt-3 flex flex-wrap gap-2">
+            {soul.attributes.map((a) => (
+              <span key={a.trait_type} className="vf-pill">
+                {a.trait_type}: {String(a.value)}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function OnChainView({ isConnected, isLoadingChain, streak, heartbeats, isLoadingSoul, soul }) {
   return (
     <>
       <PageHeader
         title="On-Chain"
-        subtitle="Mocked until Builder A's DeveloperHeartbeat contract is deployed — see the code comments for the hand-off point."
+        subtitle={
+          CONTRACT_ADDRESS
+            ? "Reads and writes go to your deployed DeveloperHeartbeat contract on Monad Testnet."
+            : "No VITE_CONTRACT_ADDRESS set yet — add it to .env once Builder A's contract is deployed."
+        }
       />
       <div className="grid grid-cols-3 gap-4">
-        <OnChainCard full />
+        <div className="col-span-2">
+          <OnChainCard full isConnected={isConnected} isLoadingChain={isLoadingChain} streak={streak} heartbeats={heartbeats} />
+        </div>
+        <SoulCard isConnected={isConnected} isLoadingSoul={isLoadingSoul} soul={soul} />
       </div>
     </>
   );
@@ -1143,7 +1551,18 @@ function AnalyticsView({ captures }) {
 /*  PAGE: SETTINGS                                                      */
 /* ------------------------------------------------------------------ */
 
-function SettingsView({ profileName, setProfileName, onReset, syncStatus }) {
+function SettingsView({
+  profileName,
+  setProfileName,
+  onReset,
+  syncStatus,
+  isConnected,
+  address,
+  onConnect,
+  onDisconnect,
+  cloudEnabled,
+  cloudSyncStatus,
+}) {
   return (
     <>
       <PageHeader title="Settings" subtitle="Profile and local data." />
@@ -1161,10 +1580,20 @@ function SettingsView({ profileName, setProfileName, onReset, syncStatus }) {
           <label className="vf-t11 block mb-1" style={{ color: "var(--text-3)" }}>
             Wallet address
           </label>
-          <input className="vf-input" value="0x7F3…A9b2" disabled />
-          <p className="vf-t10 mt-2" style={{ color: "var(--text-3)" }}>
-            Placeholder until wagmi wallet connect is wired in.
-          </p>
+          <input className="vf-input mb-2" value={isConnected ? address : "Not connected"} disabled />
+          {isConnected ? (
+            <button
+              className="vf-btn-primary"
+              style={{ background: "var(--bg-surface-2)", color: "var(--text-2)" }}
+              onClick={onDisconnect}
+            >
+              Disconnect
+            </button>
+          ) : (
+            <button className="vf-btn-primary" onClick={onConnect}>
+              Connect Wallet
+            </button>
+          )}
         </Card>
         <Card>
           <div className="text-sm font-medium mb-3">Local data</div>
@@ -1178,8 +1607,8 @@ function SettingsView({ profileName, setProfileName, onReset, syncStatus }) {
             {syncStatus === "idle" && "No changes yet"}
           </div>
           <p className="text-xs mb-3" style={{ color: "var(--text-2)" }}>
-            Captures, XP, and your Co-Pilot chat are saved to your account and persist across
-            sessions. This data is personal to you.
+            Captures, XP, and your Co-Pilot chat are saved to your browser and persist across
+            sessions on this device.
           </p>
           <button
             className="vf-btn-primary"
@@ -1188,6 +1617,31 @@ function SettingsView({ profileName, setProfileName, onReset, syncStatus }) {
           >
             <RotateCcw size={13} /> Reset local data
           </button>
+        </Card>
+        <Card className="col-span-2">
+          <div className="text-sm font-medium mb-3">Cloud sync</div>
+          {!cloudEnabled && (
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              Not configured — add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable syncing
+              across devices.
+            </p>
+          )}
+          {cloudEnabled && !isConnected && (
+            <p className="text-xs" style={{ color: "var(--text-2)" }}>
+              Connect your wallet above to sync your data across devices.
+            </p>
+          )}
+          {cloudEnabled && isConnected && (
+            <div className="flex items-center gap-2 vf-t11" style={{ color: "var(--text-3)" }}>
+              {cloudSyncStatus === "synced" && <Cloud size={14} color="var(--green)" />}
+              {cloudSyncStatus === "syncing" && <Loader2 size={14} className="animate-spin" />}
+              {cloudSyncStatus === "error" && <CloudOff size={14} color="#f87171" />}
+              {cloudSyncStatus === "synced" && "Synced to your wallet"}
+              {cloudSyncStatus === "syncing" && "Syncing…"}
+              {cloudSyncStatus === "error" && "Couldn't sync — will retry on next change"}
+              {cloudSyncStatus === "idle" && "Waiting for first sync…"}
+            </div>
+          )}
         </Card>
       </div>
     </>
@@ -1222,6 +1676,64 @@ export default function VibeForgeDashboard() {
   const activePlan = plans.find((p) => p.id === activePlanId) || null;
   const [savingMessageIndex, setSavingMessageIndex] = useState(null);
   const [savedMessageIndices, setSavedMessageIndices] = useState(() => new Set());
+
+  const [lessons, setLessons] = useState([]);
+  const [savingLessonIndex, setSavingLessonIndex] = useState(null);
+  const [savedLessonIndices, setSavedLessonIndices] = useState(() => new Set());
+
+  const [attachedImage, setAttachedImage] = useState(null); // data URL or null
+
+  const [dailyPulse, setDailyPulse] = useState(null); // { date, summary, openLoops, nextAction }
+  const [isGeneratingPulse, setIsGeneratingPulse] = useState(false);
+
+  const { address, isConnected } = useAccount();
+  const { connect } = useConnect();
+  const { disconnect } = useDisconnect();
+  const { writeContractAsync } = useWriteContract();
+  const { heartbeats, streak, isLoading: isLoadingChain } = useHeartbeats();
+  const { soul, isLoading: isLoadingSoul, refresh: refreshSoul } = useSoul();
+
+  const [cloudSyncStatus, setCloudSyncStatus] = useState("idle"); // idle | syncing | synced | error
+  const cloudEnabled = Boolean(supabase);
+
+  /* ---- image attach: file picker + clipboard paste ---- */
+  function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleImageFileSelect(file) {
+    if (!file || !file.type.startsWith("image/")) return;
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      setAttachedImage(dataUrl);
+    } catch (err) {
+      console.error("Failed to read image:", err);
+    }
+  }
+
+  async function handleImagePaste(e) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          await handleImageFileSelect(file);
+        }
+        break;
+      }
+    }
+  }
+
+  function handleRemoveImage() {
+    setAttachedImage(null);
+  }
 
   /* ---- stop any active recording if the component unmounts ---- */
   useEffect(() => {
@@ -1289,13 +1801,15 @@ export default function VibeForgeDashboard() {
   useEffect(() => {
     const startedAt = Date.now();
     (async () => {
-      const [capturesRaw, xpRaw, messagesRaw, nameRaw, plansRaw, legacyPlanRaw] = await Promise.all([
+      const [capturesRaw, xpRaw, messagesRaw, nameRaw, plansRaw, legacyPlanRaw, lessonsRaw, pulseRaw] = await Promise.all([
         safeGet(STORAGE_KEYS.captures),
         safeGet(STORAGE_KEYS.totalXP),
         safeGet(STORAGE_KEYS.messages),
         safeGet(STORAGE_KEYS.profileName),
         safeGet(STORAGE_KEYS.plans),
         safeGet(STORAGE_KEYS.legacyActivePlan),
+        safeGet(STORAGE_KEYS.lessons),
+        safeGet(STORAGE_KEYS.dailyPulse),
       ]);
       if (capturesRaw) {
         try {
@@ -1330,6 +1844,18 @@ export default function VibeForgeDashboard() {
         } catch (e) {}
       }
 
+      if (lessonsRaw) {
+        try {
+          setLessons(JSON.parse(lessonsRaw));
+        } catch (e) {}
+      }
+
+      if (pulseRaw) {
+        try {
+          setDailyPulse(JSON.parse(pulseRaw));
+        } catch (e) {}
+      }
+
       const elapsed = Date.now() - startedAt;
       const MIN_SPLASH_MS = 2000;
       if (elapsed < MIN_SPLASH_MS) {
@@ -1339,7 +1865,7 @@ export default function VibeForgeDashboard() {
     })();
   }, []);
 
-  /* ---- persist on change, after initial load ---- */
+  /* ---- persist locally on change, after initial load ---- */
   useEffect(() => {
     if (!isLoaded) return;
     setSyncStatus("saving");
@@ -1349,10 +1875,58 @@ export default function VibeForgeDashboard() {
       safeSet(STORAGE_KEYS.messages, JSON.stringify(messages)),
       safeSet(STORAGE_KEYS.profileName, profileName),
       safeSet(STORAGE_KEYS.plans, JSON.stringify({ plans, activePlanId })),
+      safeSet(STORAGE_KEYS.lessons, JSON.stringify(lessons)),
+      safeSet(STORAGE_KEYS.dailyPulse, JSON.stringify(dailyPulse)),
     ]).then((results) => {
       setSyncStatus(results.every(Boolean) ? "saved" : "error");
     });
-  }, [captures, totalXP, messages, profileName, plans, activePlanId, isLoaded]);
+  }, [captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse, isLoaded]);
+
+  /* ---- push to Supabase whenever data changes, if a wallet is connected ---- */
+  useEffect(() => {
+    if (!isLoaded || !cloudEnabled || !isConnected || !address) return;
+    setCloudSyncStatus("syncing");
+    saveCloudData(address, { captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse }).then(
+      (ok) => {
+        setCloudSyncStatus(ok ? "synced" : "error");
+      }
+    );
+  }, [captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse, isLoaded, cloudEnabled, isConnected, address]);
+
+  /* ---- on wallet connect: load existing cloud data, or seed the cloud with local data ---- */
+  useEffect(() => {
+    if (!isLoaded || !cloudEnabled || !isConnected || !address) return;
+    (async () => {
+      setCloudSyncStatus("syncing");
+      const cloud = await loadCloudData(address);
+      if (cloud) {
+        if (Array.isArray(cloud.captures)) setCaptures(cloud.captures);
+        if (typeof cloud.totalXP === "number") setTotalXP(cloud.totalXP);
+        if (Array.isArray(cloud.messages)) setMessages(cloud.messages);
+        if (cloud.profileName) setProfileName(cloud.profileName);
+        if (Array.isArray(cloud.plans)) setPlans(cloud.plans);
+        if (cloud.activePlanId !== undefined) setActivePlanId(cloud.activePlanId);
+        if (Array.isArray(cloud.lessons)) setLessons(cloud.lessons);
+        if (cloud.dailyPulse) setDailyPulse(cloud.dailyPulse);
+        setCloudSyncStatus("synced");
+      } else {
+        const ok = await saveCloudData(address, {
+          captures,
+          totalXP,
+          messages,
+          profileName,
+          plans,
+          activePlanId,
+          lessons,
+          dailyPulse,
+        });
+        setCloudSyncStatus(ok ? "synced" : "error");
+      }
+    })();
+    // Only re-run when the connected wallet itself changes, not on every local edit —
+    // the effect above already handles pushing ongoing changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isConnected, address, cloudEnabled, isLoaded]);
 
   function findMatchingStepIndex(steps, matchedStep) {
     if (!matchedStep) return -1;
@@ -1378,21 +1952,24 @@ export default function VibeForgeDashboard() {
     setIsCapturing(true);
     setCaptureError(false);
     try {
-      const raw = await callClaude(VIBE_PARSER_PROMPT, buildCaptureMessage(captureText, activePlan));
+      const raw = await callAI(VIBE_PARSER_PROMPT, buildCaptureMessage(captureText, activePlan), attachedImage);
       const cleaned = raw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(cleaned);
+      const now = Date.now();
       const entry = {
-        id: Date.now(),
+        id: now,
         category: parsed.category || "Other",
         summary: parsed.summary || captureText.slice(0, 100),
         openLoops: Array.isArray(parsed.openLoops) ? parsed.openLoops : [],
         nextStep: parsed.nextStep || "",
         xpValue: Number.isFinite(parsed.xpValue) ? parsed.xpValue : 10,
         time: "Just now",
+        createdAt: now,
       };
       setCaptures((prev) => [entry, ...prev]);
       setTotalXP((prev) => prev + entry.xpValue);
       setCaptureText("");
+      setAttachedImage(null);
 
       if (parsed.matchedStep && activePlan) {
         setPlans((prev) =>
@@ -1405,6 +1982,63 @@ export default function VibeForgeDashboard() {
             return { ...p, steps: nextSteps };
           })
         );
+      }
+
+      if (parsed.lesson) {
+        setLessons((prev) => [
+          {
+            id: `lesson-${Date.now()}`,
+            title: String(parsed.lesson),
+            category: entry.category,
+            capturedAt: Date.now(),
+            sourceCaptureId: entry.id,
+          },
+          ...prev,
+        ]);
+
+        // Optional: also log the lesson on-chain. Only succeeds if the deployed
+        // Soul contract includes logLesson — safe to leave in even if it doesn't,
+        // the failure is caught and the local/cloud lesson is already saved either way.
+        if (isConnected && SOUL_CONTRACT_ADDRESS) {
+          try {
+            await writeContractAsync({
+              address: SOUL_CONTRACT_ADDRESS,
+              abi: SOUL_ABI,
+              functionName: "logLesson",
+              args: [entry.category, String(parsed.lesson)],
+            });
+          } catch (lessonErr) {
+            console.error("On-chain lesson log failed (contract may need redeploy with logLesson support):", lessonErr);
+          }
+        }
+      }
+
+      if (isConnected && CONTRACT_ADDRESS) {
+        try {
+          await writeContractAsync({
+            address: CONTRACT_ADDRESS,
+            abi: HEARTBEAT_ABI,
+            functionName: "logHeartbeat",
+            args: [entry.category, entry.summary, BigInt(entry.xpValue)],
+          });
+        } catch (chainErr) {
+          console.error("On-chain log failed:", chainErr);
+          // capture is already saved locally even if the tx is rejected or fails
+        }
+      }
+
+      if (isConnected && SOUL_CONTRACT_ADDRESS) {
+        try {
+          await writeContractAsync({
+            address: SOUL_CONTRACT_ADDRESS,
+            abi: SOUL_ABI,
+            functionName: "logProgress",
+            args: [entry.category, BigInt(entry.xpValue)],
+          });
+          refreshSoul();
+        } catch (soulErr) {
+          console.error("Soul NFT update failed:", soulErr);
+        }
       }
     } catch (err) {
       console.error("Vibe-Parser error:", err);
@@ -1421,7 +2055,7 @@ export default function VibeForgeDashboard() {
     setCopilotInput("");
     setIsCopilotLoading(true);
     try {
-      const reply = await callClaude(COPILOT_SYSTEM_PROMPT, copilotInput);
+      const reply = await callAI(buildCopilotSystemPrompt(captures, activePlan, lessons), copilotInput);
       setMessages((prev) => [...prev, { role: "assistant", content: reply || "…" }]);
     } catch (err) {
       console.error("Co-Pilot error:", err);
@@ -1434,7 +2068,7 @@ export default function VibeForgeDashboard() {
   async function handleSaveAsPlan(messageIndex, content) {
     setSavingMessageIndex(messageIndex);
     try {
-      const raw = await callClaude(PLAN_EXTRACTOR_PROMPT, content);
+      const raw = await callAI(PLAN_EXTRACTOR_PROMPT, content);
       const cleaned = raw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(cleaned);
       const steps = (Array.isArray(parsed.steps) ? parsed.steps : []).slice(0, 8).map((label, i) => ({
@@ -1460,6 +2094,101 @@ export default function VibeForgeDashboard() {
     }
   }
 
+  async function handleSaveAsLesson(messageIndex, content) {
+    setSavingLessonIndex(messageIndex);
+    try {
+      const raw = await callAI(LESSON_EXTRACTOR_PROMPT, content);
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      if (!parsed.lesson) throw new Error("No lesson extracted");
+      setLessons((prev) => [
+        {
+          id: `lesson-${Date.now()}`,
+          title: String(parsed.lesson),
+          category: "Co-Pilot",
+          capturedAt: Date.now(),
+          sourceCaptureId: null,
+        },
+        ...prev,
+      ]);
+      setSavedLessonIndices((prev) => new Set(prev).add(messageIndex));
+
+      if (isConnected && SOUL_CONTRACT_ADDRESS) {
+        try {
+          await writeContractAsync({
+            address: SOUL_CONTRACT_ADDRESS,
+            abi: SOUL_ABI,
+            functionName: "logLesson",
+            args: ["Co-Pilot", String(parsed.lesson)],
+          });
+        } catch (lessonErr) {
+          console.error("On-chain lesson log failed (contract may need redeploy with logLesson support):", lessonErr);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to save lesson:", err);
+    } finally {
+      setSavingLessonIndex(null);
+    }
+  }
+
+  async function generateDailyPulse() {
+    if (isGeneratingPulse) return;
+    setIsGeneratingPulse(true);
+    try {
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const windowCaptures = captures.filter((c) => c.createdAt && c.createdAt >= oneDayAgo);
+      const windowLessons = lessons.filter((l) => l.capturedAt && l.capturedAt >= oneDayAgo);
+
+      const openLoops = [...new Set(windowCaptures.flatMap((c) => c.openLoops || []))].slice(0, 5);
+      const nextAction =
+        (activePlan && activePlan.steps.find((s) => s.status === "pending")?.label) ||
+        windowCaptures[0]?.nextStep ||
+        "Do a Vibe Capture to kick off today's context.";
+
+      const today = new Date().toDateString();
+
+      if (windowCaptures.length === 0 && windowLessons.length === 0) {
+        setDailyPulse({
+          date: today,
+          summary: "No activity in the last day yet — do a capture and your next pulse will actually reflect it.",
+          openLoops: [],
+          nextAction,
+        });
+        return;
+      }
+
+      const activityText = [
+        ...windowCaptures.map((c) => `Capture [${c.category}]: ${c.summary}`),
+        ...windowLessons.map((l) => `Lesson: ${l.title}`),
+      ].join("\n");
+
+      const raw = await callAI(DAILY_PULSE_PROMPT, activityText);
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+
+      setDailyPulse({
+        date: today,
+        summary: parsed.summary || "You made progress in the last day — keep it going.",
+        openLoops,
+        nextAction,
+      });
+    } catch (err) {
+      console.error("Failed to generate Daily Pulse:", err);
+    } finally {
+      setIsGeneratingPulse(false);
+    }
+  }
+
+  /* ---- auto-generate the Daily Pulse once per day, once data is loaded ---- */
+  useEffect(() => {
+    if (!isLoaded) return;
+    const today = new Date().toDateString();
+    if (dailyPulse?.date === today) return;
+    generateDailyPulse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoaded]);
+
   function handleSwitchPlan(id) {
     setActivePlanId(id);
   }
@@ -1480,6 +2209,8 @@ export default function VibeForgeDashboard() {
       safeDelete(STORAGE_KEYS.profileName),
       safeDelete(STORAGE_KEYS.plans),
       safeDelete(STORAGE_KEYS.legacyActivePlan),
+      safeDelete(STORAGE_KEYS.lessons),
+      safeDelete(STORAGE_KEYS.dailyPulse),
     ]);
     setCaptures(DEFAULT_CAPTURES);
     setTotalXP(DEFAULT_XP);
@@ -1488,6 +2219,23 @@ export default function VibeForgeDashboard() {
     setPlans([]);
     setActivePlanId(null);
     setSavedMessageIndices(new Set());
+    setLessons([]);
+    setSavedLessonIndices(new Set());
+    setDailyPulse(null);
+    setAttachedImage(null);
+
+    if (cloudEnabled && isConnected && address) {
+      await saveCloudData(address, {
+        captures: DEFAULT_CAPTURES,
+        totalXP: DEFAULT_XP,
+        messages: DEFAULT_MESSAGES,
+        profileName: DEFAULT_NAME,
+        plans: [],
+        activePlanId: null,
+        lessons: [],
+        dailyPulse: null,
+      });
+    }
   }
 
   function renderPage() {
@@ -1507,6 +2255,18 @@ export default function VibeForgeDashboard() {
             speechError={speechError}
             onToggleRecording={toggleRecording}
             activePlan={activePlan}
+            isConnected={isConnected}
+            isLoadingChain={isLoadingChain}
+            streak={streak}
+            heartbeats={heartbeats}
+            lessons={lessons}
+            attachedImage={attachedImage}
+            onImageSelect={handleImageFileSelect}
+            onRemoveImage={handleRemoveImage}
+            onImagePaste={handleImagePaste}
+            dailyPulse={dailyPulse}
+            isGeneratingPulse={isGeneratingPulse}
+            onRefreshPulse={generateDailyPulse}
             goTo={setActiveNav}
           />
         );
@@ -1517,6 +2277,8 @@ export default function VibeForgeDashboard() {
             activePlan={activePlan}
             onSwitchPlan={handleSwitchPlan}
             onDeletePlan={handleDeletePlan}
+            lessons={lessons}
+            captures={captures}
           />
         );
       case "capture":
@@ -1532,12 +2294,16 @@ export default function VibeForgeDashboard() {
             isRecording={isRecording}
             speechError={speechError}
             onToggleRecording={toggleRecording}
+            attachedImage={attachedImage}
+            onImageSelect={handleImageFileSelect}
+            onRemoveImage={handleRemoveImage}
+            onImagePaste={handleImagePaste}
           />
         );
       case "projects":
         return <ProjectsView />;
       case "learning":
-        return <LearningView />;
+        return <LearningView lessons={lessons} plans={plans} />;
       case "copilot":
         return (
           <CopilotView
@@ -1549,10 +2315,22 @@ export default function VibeForgeDashboard() {
             savingMessageIndex={savingMessageIndex}
             savedMessageIndices={savedMessageIndices}
             onSaveAsPlan={handleSaveAsPlan}
+            savingLessonIndex={savingLessonIndex}
+            savedLessonIndices={savedLessonIndices}
+            onSaveAsLesson={handleSaveAsLesson}
           />
         );
       case "onchain":
-        return <OnChainView />;
+        return (
+          <OnChainView
+            isConnected={isConnected}
+            isLoadingChain={isLoadingChain}
+            streak={streak}
+            heartbeats={heartbeats}
+            isLoadingSoul={isLoadingSoul}
+            soul={soul}
+          />
+        );
       case "analytics":
         return <AnalyticsView captures={captures} />;
       case "settings":
@@ -1562,6 +2340,12 @@ export default function VibeForgeDashboard() {
             setProfileName={setProfileName}
             onReset={handleReset}
             syncStatus={syncStatus}
+            isConnected={isConnected}
+            address={address}
+            onConnect={() => connect({ connector: injected() })}
+            onDisconnect={() => disconnect()}
+            cloudEnabled={cloudEnabled}
+            cloudSyncStatus={cloudSyncStatus}
           />
         );
       default:
@@ -1745,9 +2529,31 @@ export default function VibeForgeDashboard() {
             <div className="rounded-full" style={{ width: 28, height: 28, background: "var(--accent)" }} />
             <div className="flex-1">
               <div className="text-xs font-medium">{profileName}</div>
-              <div className="vf-t10" style={{ color: "var(--text-3)" }}>
-                0x7F3…A9b2
-              </div>
+              {isConnected ? (
+                <div
+                  className="vf-t10 vf-link"
+                  style={{ color: "var(--text-3)" }}
+                  onClick={() => disconnect()}
+                  title="Click to disconnect"
+                >
+                  {address.slice(0, 6)}…{address.slice(-4)}
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="vf-t10 vf-link"
+                  onClick={() => connect({ connector: injected() })}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    cursor: "pointer",
+                    color: "var(--accent-light)",
+                  }}
+                >
+                  Connect Wallet
+                </button>
+              )}
             </div>
             {syncStatus === "saved" && <Cloud size={12} color="var(--green)" />}
             {syncStatus === "saving" && <Loader2 size={12} className="animate-spin" color="var(--text-3)" />}

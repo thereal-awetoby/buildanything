@@ -1,23 +1,10 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" })); // default 100kb is too small for screenshot uploads
-
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
-
-if (!process.env.GEMINI_API_KEY) {
-  console.warn("⚠️  GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.");
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseImageDataUrl(image) {
-  // Expects "data:image/png;base64,AAAA..." — returns { mimeType, data } or null.
   if (!image || typeof image !== "string") return null;
   const match = image.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
   if (!match) return null;
@@ -47,11 +34,9 @@ async function callGeminiWithRetry(system, message, jsonMode, image, retries = 3
       }),
     });
 
-    // 503 = model overloaded ("high demand"). Retry with a short backoff.
-    // 429 = rate limited. Also worth a brief retry.
     if ((response.status === 503 || response.status === 429) && attempt < retries) {
-      const delay = 500 * Math.pow(2, attempt); // 500ms, 1s, 2s
-      console.warn(`Gemini busy (${response.status}), retrying in ${delay}ms… (attempt ${attempt + 1}/${retries})`);
+      const delay = 500 * Math.pow(2, attempt);
+      console.warn(`Gemini busy (${response.status}), retrying in ${delay}ms…`);
       await sleep(delay);
       continue;
     }
@@ -60,9 +45,28 @@ async function callGeminiWithRetry(system, message, jsonMode, image, retries = 3
   }
 }
 
-app.post("/api/ai", async (req, res) => {
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "10mb",
+    },
+  },
+};
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
   const { system, message, jsonMode, image } = req.body || {};
-  if (!message) return res.status(400).json({ error: "message is required" });
+  if (!message) {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    console.error("GEMINI_API_KEY is not set in this Vercel project's environment variables.");
+    return res.status(500).json({ error: "Server is missing its API key." });
+  }
 
   try {
     const response = await callGeminiWithRetry(system, message, jsonMode, image);
@@ -78,12 +82,9 @@ app.post("/api/ai", async (req, res) => {
     }
 
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    res.json({ text });
+    res.status(200).json({ text });
   } catch (err) {
     console.error("Failed to reach Gemini API:", err);
     res.status(500).json({ error: "Failed to reach Gemini API" });
   }
-});
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`VibeForge API server running at http://localhost:${PORT}`));
+}
