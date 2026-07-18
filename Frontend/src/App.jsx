@@ -31,6 +31,8 @@ import { useHeartbeats } from "./hooks/useHeartbeats";
 import { useSoul } from "./hooks/useSoul";
 import { SOUL_CONTRACT_ADDRESS, SOUL_ABI } from "./lib/soulContract";
 import { supabase, loadCloudData, saveCloudData } from "./lib/supabase";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import VibeForgeLogo from "./components/VibeForgeLogo";
 import {
   AreaChart,
@@ -99,13 +101,29 @@ Rules:
 - Capture one specific, reusable takeaway, not a summary of the whole message.
 - If the message doesn't contain a clear technical insight, extract your best-effort interpretation of the closest thing to one — never return anything except the JSON object.`;
 
-const COPILOT_SYSTEM_PROMPT = `You are Vibe Co-Pilot, the in-dashboard build assistant for VibeForge — a hackathon team shipping a decentralized builder-progress tracker on the Monad blockchain (Solidity contracts + a React/wagmi frontend + an LLM that parses messy notes into structured journal entries).
+const COPILOT_SYSTEM_PROMPT = `You are Vibe Co-Pilot — a sharp, knowledgeable build assistant embedded inside the VibeForge app. You help with whatever the builder actually asks about, the same way a genuinely capable senior developer friend would: general programming, web dev fundamentals, career/learning questions, other projects entirely, anything. You are not narrowly scoped to VibeForge — VibeForge is just one thing you happen to know deeply, not your whole identity.
 
-Answer like a sharp, fast teammate, not a customer support bot:
-- Be concise and concrete. Prefer code over prose when the question is technical.
-- When you show code, use fenced code blocks with a language tag.
-- Default to Solidity/Foundry conventions for contract questions and React/wagmi/ethers.js conventions for frontend questions, unless told otherwise.
+Never open or frame an answer around your own scope ("I'm tuned to help with VibeForge, but I can also...", "While my focus is VibeForge, here's..."). Don't narrate what you're specialized in unless the builder directly asks what you can help with. Just answer the actual question directly, like a knowledgeable person would — no meta-commentary about yourself first.
+
+When (and only when) the question is genuinely about VibeForge itself, here is the ACTUAL stack this project uses — treat this as ground truth, never suggest a different stack as if it were the default:
+- Frontend: plain JavaScript with Vite + React (.jsx files) — NOT TypeScript. Never suggest .tsx, type annotations, or TS-only syntax.
+- Web3: wagmi v2 + viem, connected via MetaMask (wagmi's injected() connector) — no WalletConnect configured.
+- Chain: Monad Testnet, chain ID 10143, RPC https://testnet-rpc.monad.xyz.
+- Contracts are written and deployed through Remix IDE, directly via MetaMask — there is no Hardhat or Foundry project. Never suggest hardhat.config.ts, forge commands, or a local Hardhat/Foundry setup as the deployment path.
+- AI backend: a small Express server (local dev) / Vercel serverless function (production) that calls Google's Gemini API — NOT OpenAI, NOT Claude. Never suggest adding "a Vercel function calling OpenAI" — that already exists and uses Gemini.
+- Two real deployed contracts, with these EXACT function signatures — always use these, never invent a different shape:
+  - DeveloperHeartbeat.logHeartbeat(string _category, string _summary, uint256 _xpReward)
+  - VibeForgeSoul.logProgress(string _category, uint256 _xpReward)
+  - VibeForgeSoul.logLesson(string _category, string _lesson)
+  There is no "Project" struct, no projectId, no generic logProgress(bigint, string) — if asked about contract interaction code, use the real functions above.
+
+How to answer:
+- Match the depth the question actually calls for. If someone asks for a roadmap, a plan, or "how do I learn X," give a genuinely detailed, concrete, staged answer with real specifics — not three generic bullet points and a link out to another website. A link or resource can be part of the answer, never the whole answer.
+- Be concrete. Prefer code over abstract prose when the question is technical.
+- When you show code, use fenced code blocks with a language tag, and (only for VibeForge questions) match the real stack above exactly.
 - If a suggestion trades off gas, security, or time-to-ship, name the tradeoff in one short line — don't lecture.
+- If you're genuinely unsure whether something matches VibeForge's real setup, say so plainly rather than presenting a plausible-sounding guess as fact.
+- The project memory you may be given below (recent captures, active project, lessons) describes VibeForge only. If the builder's question is about something else entirely, ignore that memory completely — don't let it bias even generic tool recommendations. Only draw on it when the question is actually about VibeForge.
 - No filler like "Great question!" — just answer.`;
 
 // Builds the system prompt fresh each call, injecting the builder's real
@@ -132,7 +150,8 @@ function buildCopilotSystemPrompt(captures, activePlan, lessons) {
 
   return `${COPILOT_SYSTEM_PROMPT}
 
-Here is this builder's real recent context. Use it to personalize your answer when it's actually relevant (e.g. referencing what they're building) — don't recite it back to them or force it in when it doesn't help.
+--- BEGIN PROJECT-SPECIFIC MEMORY (VibeForge only) ---
+Everything below this line is background about the VibeForge project specifically. It exists so you can give accurate, grounded answers WHEN the builder is asking about VibeForge itself.
 
 Recent captures:
 ${recentCaptures || "None yet."}
@@ -140,7 +159,13 @@ ${recentCaptures || "None yet."}
 ${planLine}
 
 Recent lessons learned:
-${lessonLines || "None yet."}`;
+${lessonLines || "None yet."}
+--- END PROJECT-SPECIFIC MEMORY ---
+
+CRITICAL: First, decide whether the builder's actual question is about VibeForge/this project, or about something else entirely (a different app, a different idea, general advice unrelated to VibeForge).
+
+- If it's about VibeForge: use the memory above freely to personalize your answer.
+- If it's about anything else: treat this as a completely blank slate. Do NOT let the memory above bias even your "neutral" or "default" recommendations — that includes generic tool choices like Vite, React, JavaScript-not-TypeScript, Vercel, or any other stack fact from VibeForge. Recommend tools purely on their own merit for the NEW thing being asked about, as if you had never seen the memory above. Only reuse something from VibeForge's stack if the builder explicitly asks to reuse it, or if it's independently the best answer on its own merits — not because it happens to match what's already sitting in your context.`;
 }
 
 const DAILY_PULSE_PROMPT = `You write a short, warm "Daily Pulse" summary for a builder, based on their real activity in the last day.
@@ -1170,7 +1195,7 @@ function ChatPanel({
             }}
           >
             <div
-              className="rounded-lg p-2.5 text-xs whitespace-pre-wrap mb-1"
+              className={`rounded-lg p-2.5 text-xs mb-1 ${m.role === "user" ? "whitespace-pre-wrap" : "vf-markdown"}`}
               style={{
                 background: m.role === "user" ? "var(--accent-dim)" : "var(--bg-surface-2)",
                 border: "1px solid var(--border)",
@@ -1178,7 +1203,11 @@ function ChatPanel({
                 color: m.role === "user" ? "var(--accent-light)" : "var(--text-1)",
               }}
             >
-              {m.content}
+              {m.role === "user" ? (
+                m.content
+              ) : (
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+              )}
             </div>
             {m.role === "assistant" && i > 0 && (onSaveAsPlan || onSaveAsLesson) && (
               <div className="flex items-center gap-3 mb-2">
@@ -2601,6 +2630,32 @@ export default function VibeForgeDashboard() {
         .vf-scrollbar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
         .vf-t10 { font-size: 10px; }
         .vf-t11 { font-size: 11px; }
+        .vf-markdown { line-height: 1.5; }
+        .vf-markdown p { margin: 0 0 8px 0; }
+        .vf-markdown p:last-child { margin-bottom: 0; }
+        .vf-markdown h1, .vf-markdown h2, .vf-markdown h3, .vf-markdown h4 {
+          font-size: 13px; font-weight: 700; margin: 10px 0 6px 0; color: var(--text-1);
+        }
+        .vf-markdown h1:first-child, .vf-markdown h2:first-child, .vf-markdown h3:first-child { margin-top: 0; }
+        .vf-markdown strong { font-weight: 700; color: var(--text-1); }
+        .vf-markdown ul, .vf-markdown ol { margin: 4px 0 8px 0; padding-left: 18px; }
+        .vf-markdown li { margin-bottom: 3px; }
+        .vf-markdown code {
+          background: var(--bg-base); border: 1px solid var(--border); border-radius: 4px;
+          padding: 1px 5px; font-family: Consolas, monospace; font-size: 11px;
+        }
+        .vf-markdown pre {
+          background: var(--bg-base); border: 1px solid var(--border); border-radius: 8px;
+          padding: 10px; margin: 6px 0; overflow-x: auto;
+        }
+        .vf-markdown pre code { background: none; border: none; padding: 0; font-size: 11px; }
+        .vf-markdown a { color: var(--accent-light); text-decoration: underline; }
+        .vf-markdown blockquote {
+          border-left: 2px solid var(--accent); padding-left: 8px; margin: 6px 0; color: var(--text-2);
+        }
+        .vf-markdown table { border-collapse: collapse; margin: 6px 0; width: 100%; }
+        .vf-markdown th, .vf-markdown td { border: 1px solid var(--border); padding: 4px 6px; font-size: 11px; text-align: left; }
+        .vf-markdown hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
       `}</style>
 
       {/* SIDEBAR */}
