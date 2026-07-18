@@ -177,38 +177,6 @@ const NAV_ITEMS = [
 /*  hardcoded until the real contract + BuildAnything API land)        */
 /* ------------------------------------------------------------------ */
 
-const PROJECTS = [
-  { name: "Staking DApp", desc: "A decentralized staking platform built on Monad.", progress: 60 },
-  { name: "NFT Reputation System", desc: "Soulbound reputation for builders on-chain.", progress: 30 },
-  { name: "On-Chain Journal", desc: "Personal on-chain knowledge and progress tracker.", progress: 80 },
-];
-
-const ANALYTICS_DATA = [
-  { day: "M", xp: 40 },
-  { day: "T", xp: 62 },
-  { day: "W", xp: 51 },
-  { day: "T", xp: 78 },
-  { day: "F", xp: 65 },
-  { day: "S", xp: 88 },
-  { day: "S", xp: 74 },
-];
-
-const SKILLS = [
-  { label: "Solidity", pct: 90 },
-  { label: "Monad", pct: 75 },
-  { label: "Smart Contracts", pct: 65 },
-  { label: "Frontend", pct: 55 },
-];
-
-const KNOWLEDGE_NODES = [
-  { label: "Lesson 12", sub: "Smart Contracts", angle: -90 },
-  { label: "Idea", sub: "Reputation System", angle: -30 },
-  { label: "Capture", sub: "Error Handling", angle: 30 },
-  { label: "Snippet", sub: "useMonadClient", angle: 90 },
-  { label: "Note", sub: "Gas Optimization", angle: 150 },
-  { label: "Artifact", sub: "Staking Module", angle: 210 },
-];
-
 function computeBadges(lessons, plans) {
   const badges = [];
   if (lessons.length >= 1) badges.push({ id: "first-lesson", label: "First Lesson" });
@@ -222,44 +190,35 @@ function computeBadges(lessons, plans) {
   return badges;
 }
 
-const DEFAULT_CAPTURES = [
-  {
-    id: 1,
-    category: "Frontend",
-    summary: "Fixed the dashboard rendering bugs on React.",
-    openLoops: ["Connect MetaMask wallet state", "Animate the forge fire"],
-    nextStep: "Create a wagmi hooks wrapper.",
-    xpValue: 15,
-    time: "2h ago",
-  },
-  {
-    id: 2,
-    category: "Contracts",
-    summary: "Wrote the logHeartbeat function and unit tests.",
-    openLoops: ["Gas profiling"],
-    nextStep: "Deploy to Monad Devnet.",
-    xpValue: 20,
-    time: "5h ago",
-  },
-];
+// Fresh means fresh — no fake example captures, no placeholder name. Every
+// brand new identity (guest or a first-time wallet) starts genuinely empty.
+const DEFAULT_CAPTURES = [];
 
 const DEFAULT_MESSAGES = [
   { role: "assistant", content: "Ask me anything about your code or architecture." },
 ];
 
 const DEFAULT_XP = 0;
-const DEFAULT_NAME = "Toby";
+const DEFAULT_NAME = "";
 
-const STORAGE_KEYS = {
-  captures: "vibeforge:captures",
-  totalXP: "vibeforge:total-xp",
-  messages: "vibeforge:copilot-messages",
-  profileName: "vibeforge:profile-name",
-  plans: "vibeforge:plans",
-  lessons: "vibeforge:lessons",
-  dailyPulse: "vibeforge:daily-pulse",
-  legacyActivePlan: "vibeforge:active-plan", // old single-plan key, read once for migration
+// Storage is scoped per-identity (wallet address, or "guest" when no wallet
+// is connected) so two different wallets on the same browser never see or
+// overwrite each other's data, and a guest session never bleeds into a
+// wallet's data once one connects.
+const STORAGE_BASE_KEYS = {
+  captures: "captures",
+  totalXP: "total-xp",
+  messages: "copilot-messages",
+  profileName: "profile-name",
+  plans: "plans",
+  lessons: "lessons",
+  dailyPulse: "daily-pulse",
+  nameBannerDismissed: "name-banner-dismissed",
 };
+
+function scopedStorageKey(base, identity) {
+  return `vibeforge:${identity || "guest"}:${base}`;
+}
 
 /* ------------------------------------------------------------------ */
 /*  API + STORAGE HELPERS                                              */
@@ -426,6 +385,58 @@ function ImageAttachRow({ attachedImage, onFileSelect, onRemoveImage }) {
   );
 }
 
+function NameBannerPrompt({ onSetName, onDismiss }) {
+  const [value, setValue] = useState("");
+
+  function submit() {
+    const trimmed = value.trim();
+    if (trimmed) onSetName(trimmed);
+  }
+
+  return (
+    <Card className="mb-4">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Sparkles size={14} color="var(--accent-light)" style={{ flexShrink: 0 }} />
+        <span className="vf-t11" style={{ color: "var(--text-2)", flexShrink: 0 }}>
+          What should we call you?
+        </span>
+        <input
+          className="vf-input"
+          style={{ maxWidth: 180, flex: "1 1 140px" }}
+          placeholder="Your name"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+        <button
+          className="vf-btn-primary"
+          style={{ padding: "6px 10px" }}
+          onClick={submit}
+          disabled={!value.trim()}
+        >
+          Save
+        </button>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          style={{
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            color: "var(--text-3)",
+            marginLeft: "auto",
+            display: "flex",
+            padding: 0,
+          }}
+        >
+          <X size={14} />
+        </button>
+      </div>
+    </Card>
+  );
+}
+
 function DailyPulseCard({ pulse, isGenerating, onRefresh }) {
   return (
     <Card className="mb-4">
@@ -501,6 +512,7 @@ function DashboardView({
   speechError,
   onToggleRecording,
   activePlan,
+  plans,
   isConnected,
   isLoadingChain,
   streak,
@@ -513,15 +525,22 @@ function DashboardView({
   dailyPulse,
   isGeneratingPulse,
   onRefreshPulse,
+  nameBannerDismissed,
+  onSetName,
+  onDismissNameBanner,
   goTo,
 }) {
   return (
     <>
       <PageHeader
-        title={`Good morning, ${profileName}.`}
+        title={profileName ? `Good morning, ${profileName}.` : "Good morning."}
         subtitle="Here's your builder pulse for today."
         right={<StreakBadge days={streak} />}
       />
+
+      {!profileName && !nameBannerDismissed && (
+        <NameBannerPrompt onSetName={onSetName} onDismiss={onDismissNameBanner} />
+      )}
 
       <DailyPulseCard pulse={dailyPulse} isGenerating={isGeneratingPulse} onRefresh={onRefreshPulse} />
 
@@ -593,7 +612,7 @@ function DashboardView({
       </div>
 
       <div className="grid grid-cols-3 gap-4">
-        <ProjectsCard onViewAll={() => goTo("projects")} />
+        <ProjectsCard onViewAll={() => goTo("projects")} plans={plans} goTo={goTo} />
         <CopilotPreviewCard onOpen={() => goTo("copilot")} />
         <OnChainCard
           onViewAll={() => goTo("onchain")}
@@ -778,8 +797,10 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
     }));
     centerLabel = mostFrequentCategory(captures) ? `Your ${mostFrequentCategory(captures)} Work` : "Your Knowledge";
   } else {
-    nodes = KNOWLEDGE_NODES.map((n) => ({ angle: n.angle, done: false, top: n.label, sub: n.sub }));
-    centerLabel = "Staking DApp";
+    // Genuinely empty — no fabricated example nodes. The graph fills in for real
+    // once there's an active plan or at least one capture/lesson.
+    nodes = [];
+    centerLabel = "Your Forge";
   }
 
   const doneCount = hasPlan ? activePlan.steps.filter((s) => s.status === "done").length : 0;
@@ -940,7 +961,7 @@ function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan, lessons, cap
         </div>
         <Card>
           <div className="text-sm font-medium mb-3">
-            {hasPlan ? "Steps" : lessons.length > 0 ? "Recent Lessons" : "Node Legend"}
+            {hasPlan ? "Steps" : lessons.length > 0 ? "Recent Lessons" : "Getting Started"}
           </div>
           <div className="flex flex-col gap-2">
             {hasPlan
@@ -957,12 +978,12 @@ function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan, lessons, cap
                     <CategoryPill category={l.category} />
                   </div>
                 ))
-              : KNOWLEDGE_NODES.map((n) => (
-                  <div key={n.label} className="flex items-center justify-between vf-t11">
-                    <span style={{ color: "var(--text-1)" }}>{n.label}</span>
-                    <span style={{ color: "var(--text-3)" }}>{n.sub}</span>
-                  </div>
-                ))}
+              : (
+                  <p className="vf-t11" style={{ color: "var(--text-2)" }}>
+                    Do a Vibe Capture, or ask Co-Pilot for a plan — your real knowledge graph builds
+                    itself from there.
+                  </p>
+                )}
           </div>
         </Card>
       </div>
@@ -974,7 +995,7 @@ function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan, lessons, cap
 /*  PAGE: PROJECTS                                                      */
 /* ------------------------------------------------------------------ */
 
-function ProjectsCard({ onViewAll, full }) {
+function ProjectsCard({ onViewAll, full, plans = [], goTo }) {
   return (
     <Card>
       <div className="flex items-center justify-between mb-3">
@@ -984,43 +1005,54 @@ function ProjectsCard({ onViewAll, full }) {
             View all
           </span>
         ) : (
-          <button className="vf-btn-primary" style={{ padding: "6px 10px" }}>
+          <button className="vf-btn-primary" style={{ padding: "6px 10px" }} onClick={() => goTo && goTo("copilot")}>
             <Plus size={13} /> New
           </button>
         )}
       </div>
-      <div className={full ? "grid grid-cols-3 gap-3" : "flex flex-col gap-2"}>
-        {PROJECTS.map((p) => (
-          <div
-            key={p.name}
-            className="rounded-lg p-3"
-            style={{ background: "var(--bg-surface-2)", border: "1px solid var(--border)" }}
-          >
-            <div className="text-sm font-medium mb-1">{p.name}</div>
-            <div className="vf-t11 mb-2" style={{ color: "var(--text-3)" }}>
-              {p.desc}
-            </div>
-            <div className="rounded-full" style={{ height: 4, background: "var(--bg-base)" }}>
+      {plans.length === 0 ? (
+        <p className="text-xs" style={{ color: "var(--text-2)" }}>
+          No projects yet — ask Vibe Co-Pilot for a plan, then "Save as Forge plan" to start
+          tracking one here.
+        </p>
+      ) : (
+        <div className={full ? "grid grid-cols-3 gap-3" : "flex flex-col gap-2"}>
+          {plans.map((p) => {
+            const done = p.steps.filter((s) => s.status === "done").length;
+            const pct = p.steps.length ? Math.round((done / p.steps.length) * 100) : 0;
+            return (
               <div
-                className="rounded-full"
-                style={{ height: 4, width: `${p.progress}%`, background: "var(--accent)" }}
-              />
-            </div>
-            <div className="vf-t10 mt-1" style={{ color: "var(--text-3)" }}>
-              {p.progress}%
-            </div>
-          </div>
-        ))}
-      </div>
+                key={p.id}
+                className="rounded-lg p-3"
+                style={{ background: "var(--bg-surface-2)", border: "1px solid var(--border)" }}
+              >
+                <div className="text-sm font-medium mb-1">{p.projectName}</div>
+                <div className="vf-t11 mb-2" style={{ color: "var(--text-3)" }}>
+                  {done} of {p.steps.length} steps complete
+                </div>
+                <div className="rounded-full" style={{ height: 4, background: "var(--bg-base)" }}>
+                  <div
+                    className="rounded-full"
+                    style={{ height: 4, width: `${pct}%`, background: "var(--accent)" }}
+                  />
+                </div>
+                <div className="vf-t10 mt-1" style={{ color: "var(--text-3)" }}>
+                  {pct}%
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </Card>
   );
 }
 
-function ProjectsView() {
+function ProjectsView({ plans, goTo }) {
   return (
     <>
-      <PageHeader title="Projects" subtitle="Your active builds." />
-      <ProjectsCard full />
+      <PageHeader title="Projects" subtitle="Your active builds — the same plans tracked in My Forge." />
+      <ProjectsCard full plans={plans} goTo={goTo} />
     </>
   );
 }
@@ -1440,6 +1472,27 @@ function OnChainView({ isConnected, isLoadingChain, streak, heartbeats, isLoadin
 /*  PAGE: ANALYTICS                                                     */
 /* ------------------------------------------------------------------ */
 
+function computeWeeklyXP(captures) {
+  const days = [];
+  const now = new Date();
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+    const xp = captures
+      .filter((c) => c.createdAt && c.createdAt >= dayStart && c.createdAt < dayEnd)
+      .reduce((sum, c) => sum + (c.xpValue || 0), 0);
+    days.push({ day: d.toLocaleDateString(undefined, { weekday: "short" }).slice(0, 1), xp });
+  }
+  return days;
+}
+
+function countDaysActive(captures) {
+  const days = new Set(captures.filter((c) => c.createdAt).map((c) => new Date(c.createdAt).toDateString()));
+  return days.size;
+}
+
 function AnalyticsCard({ captures, compact }) {
   const byCategory = captures.reduce((acc, c) => {
     acc[c.category] = (acc[c.category] || 0) + 1;
@@ -1447,6 +1500,7 @@ function AnalyticsCard({ captures, compact }) {
   }, {});
   const categoryEntries = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
   const maxCount = categoryEntries.length ? categoryEntries[0][1] : 1;
+  const weeklyData = computeWeeklyXP(captures);
 
   return (
     <Card>
@@ -1456,7 +1510,7 @@ function AnalyticsCard({ captures, compact }) {
       </p>
       <div style={{ height: 110 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={ANALYTICS_DATA} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
+          <AreaChart data={weeklyData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
             <defs>
               <linearGradient id="vfXp" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.5} />
@@ -1493,39 +1547,31 @@ function AnalyticsCard({ captures, compact }) {
           </div>
         </div>
       )}
-
-      <div className="flex flex-col gap-2 mt-3">
-        {SKILLS.map((s) => (
-          <div key={s.label}>
-            <div className="flex justify-between vf-t11 mb-1">
-              <span style={{ color: "var(--text-2)" }}>{s.label}</span>
-              <span style={{ color: "var(--text-3)" }}>{s.pct}%</span>
-            </div>
-            <div className="rounded-full" style={{ height: 4, background: "var(--bg-surface-2)" }}>
-              <div className="rounded-full" style={{ height: 4, width: `${s.pct}%`, background: "var(--accent)" }} />
-            </div>
-          </div>
-        ))}
-      </div>
+      {!compact && categoryEntries.length === 0 && (
+        <p className="text-xs mt-3" style={{ color: "var(--text-2)" }}>
+          No captures yet — this fills in as you build.
+        </p>
+      )}
     </Card>
   );
 }
 
-function AnalyticsView({ captures }) {
+function AnalyticsView({ captures, totalXP, lessons }) {
+  const stats = [
+    { label: "Captures", value: String(captures.length) },
+    { label: "Total XP", value: totalXP.toLocaleString() },
+    { label: "Lessons Learned", value: String(lessons.length) },
+    { label: "Days Active", value: String(countDaysActive(captures)) },
+  ];
   return (
     <>
-      <PageHeader title="Analytics" subtitle="Weekly XP trend, skill breakdown, and capture categories — the last one computed live from your real captures." />
+      <PageHeader title="Analytics" subtitle="Weekly XP trend, capture categories, and real stats — all computed live from your own data." />
       <div className="grid grid-cols-2 gap-4">
         <AnalyticsCard captures={captures} />
         <Card>
-          <div className="text-sm font-medium mb-3">Focus Time / Captures / Code / XP</div>
+          <div className="text-sm font-medium mb-3">Overview</div>
           <div className="grid grid-cols-2 gap-3">
-            {[
-              { label: "Focus Time", value: "24h", delta: "+12%" },
-              { label: "Captures", value: String(captures.length), delta: "+9%" },
-              { label: "Code Written", value: "1.2k", delta: "+15%" },
-              { label: "On-Chain XP", value: "2.4k", delta: "+20%" },
-            ].map((s) => (
+            {stats.map((s) => (
               <div
                 key={s.label}
                 className="rounded-lg p-3"
@@ -1535,9 +1581,6 @@ function AnalyticsView({ captures }) {
                   {s.label}
                 </div>
                 <div className="text-lg font-semibold">{s.value}</div>
-                <div className="vf-t10" style={{ color: "var(--green)" }}>
-                  {s.delta}
-                </div>
               </div>
             ))}
           </div>
@@ -1575,6 +1618,7 @@ function SettingsView({
           <input
             className="vf-input mb-3"
             value={profileName}
+            placeholder="What should we call you?"
             onChange={(e) => setProfileName(e.target.value)}
           />
           <label className="vf-t11 block mb-1" style={{ color: "var(--text-3)" }}>
@@ -1666,6 +1710,9 @@ export default function VibeForgeDashboard() {
   const [isRecording, setIsRecording] = useState(false);
   const [speechError, setSpeechError] = useState(false);
   const recognitionRef = useRef(null);
+  const previousIdentityRef = useRef(undefined); // undefined = not yet resolved even once
+  const isFirstLoadRef = useRef(true);
+  const [isSwitchingAccount, setIsSwitchingAccount] = useState(false);
 
   const [messages, setMessages] = useState(DEFAULT_MESSAGES);
   const [copilotInput, setCopilotInput] = useState("");
@@ -1686,7 +1733,9 @@ export default function VibeForgeDashboard() {
   const [dailyPulse, setDailyPulse] = useState(null); // { date, summary, openLoops, nextAction }
   const [isGeneratingPulse, setIsGeneratingPulse] = useState(false);
 
-  const { address, isConnected } = useAccount();
+  const [nameBannerDismissed, setNameBannerDismissed] = useState(false);
+
+  const { address, isConnected, status: accountStatus } = useAccount();
   const { connect } = useConnect();
   const { disconnect } = useDisconnect();
   const { writeContractAsync } = useWriteContract();
@@ -1797,136 +1846,194 @@ export default function VibeForgeDashboard() {
     }
   }
 
-  /* ---- load persisted data once on mount ---- */
+  /* ---- load fresh whenever the active identity changes (mount, connect, or switch wallet) ----
+     Every identity change resets state to genuinely empty first, THEN loads whatever
+     exists for that specific identity (cloud first if a wallet + Supabase are available,
+     else local storage scoped to that identity). This is what stops one wallet's data
+     from ever bleeding into another's, and stops a guest session from being uploaded
+     as a new wallet's "existing" data. */
   useEffect(() => {
-    const startedAt = Date.now();
+    // Wait for wagmi to finish checking for an auto-reconnecting wallet before the
+    // very first load — otherwise a returning wallet user would briefly load as
+    // "guest" and then immediately reload again once their wallet reconnects.
+    if (isFirstLoadRef.current && (accountStatus === "connecting" || accountStatus === "reconnecting")) return;
+
+    const identity = address || "guest";
+    if (previousIdentityRef.current === identity) return;
+    const isFirstLoad = isFirstLoadRef.current;
+    previousIdentityRef.current = identity;
+    isFirstLoadRef.current = false;
+
     (async () => {
-      const [capturesRaw, xpRaw, messagesRaw, nameRaw, plansRaw, legacyPlanRaw, lessonsRaw, pulseRaw] = await Promise.all([
-        safeGet(STORAGE_KEYS.captures),
-        safeGet(STORAGE_KEYS.totalXP),
-        safeGet(STORAGE_KEYS.messages),
-        safeGet(STORAGE_KEYS.profileName),
-        safeGet(STORAGE_KEYS.plans),
-        safeGet(STORAGE_KEYS.legacyActivePlan),
-        safeGet(STORAGE_KEYS.lessons),
-        safeGet(STORAGE_KEYS.dailyPulse),
-      ]);
-      if (capturesRaw) {
-        try {
-          setCaptures(JSON.parse(capturesRaw));
-        } catch (e) {}
-      }
-      if (xpRaw) {
-        try {
-          setTotalXP(JSON.parse(xpRaw));
-        } catch (e) {}
-      }
-      if (messagesRaw) {
-        try {
-          setMessages(JSON.parse(messagesRaw));
-        } catch (e) {}
-      }
-      if (nameRaw) setProfileName(nameRaw);
+      const startedAt = Date.now();
+      if (!isFirstLoad) setIsSwitchingAccount(true);
 
-      if (plansRaw) {
-        try {
-          const parsed = JSON.parse(plansRaw);
-          setPlans(Array.isArray(parsed.plans) ? parsed.plans : []);
-          setActivePlanId(parsed.activePlanId || null);
-        } catch (e) {}
-      } else if (legacyPlanRaw) {
-        // one-time migration from the old single-plan format
-        try {
-          const old = JSON.parse(legacyPlanRaw);
-          const migrated = { ...old, id: old.id || `plan-${Date.now()}` };
-          setPlans([migrated]);
-          setActivePlanId(migrated.id);
-        } catch (e) {}
+      // Reset to genuinely fresh state before loading anything for this identity.
+      setCaptures(DEFAULT_CAPTURES);
+      setTotalXP(DEFAULT_XP);
+      setMessages(DEFAULT_MESSAGES);
+      setProfileName(DEFAULT_NAME);
+      setPlans([]);
+      setActivePlanId(null);
+      setLessons([]);
+      setDailyPulse(null);
+      setSavedMessageIndices(new Set());
+      setSavedLessonIndices(new Set());
+      setNameBannerDismissed(false);
+
+      let loadedFromCloud = false;
+      if (identity !== "guest" && cloudEnabled) {
+        setCloudSyncStatus("syncing");
+        const cloud = await loadCloudData(identity);
+        if (cloud) {
+          if (Array.isArray(cloud.captures)) setCaptures(cloud.captures);
+          if (typeof cloud.totalXP === "number") setTotalXP(cloud.totalXP);
+          if (Array.isArray(cloud.messages)) setMessages(cloud.messages);
+          if (cloud.profileName) setProfileName(cloud.profileName);
+          if (Array.isArray(cloud.plans)) setPlans(cloud.plans);
+          if (cloud.activePlanId !== undefined) setActivePlanId(cloud.activePlanId);
+          if (Array.isArray(cloud.lessons)) setLessons(cloud.lessons);
+          if (cloud.dailyPulse) setDailyPulse(cloud.dailyPulse);
+          loadedFromCloud = true;
+          setCloudSyncStatus("synced");
+        } else {
+          setCloudSyncStatus("idle");
+        }
       }
 
-      if (lessonsRaw) {
+      if (!loadedFromCloud) {
+        const [capturesRaw, xpRaw, messagesRaw, nameRaw, plansRaw, legacyPlanRaw, lessonsRaw, pulseRaw] = await Promise.all([
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.captures, identity)),
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.totalXP, identity)),
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.messages, identity)),
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.profileName, identity)),
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.plans, identity)),
+          identity === "guest" ? safeGet("vibeforge:active-plan") : Promise.resolve(null), // legacy single-plan migration, guest scope only
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.lessons, identity)),
+          safeGet(scopedStorageKey(STORAGE_BASE_KEYS.dailyPulse, identity)),
+        ]);
+        if (capturesRaw) {
+          try {
+            setCaptures(JSON.parse(capturesRaw));
+          } catch (e) {}
+        }
+        if (xpRaw) {
+          try {
+            setTotalXP(JSON.parse(xpRaw));
+          } catch (e) {}
+        }
+        if (messagesRaw) {
+          try {
+            setMessages(JSON.parse(messagesRaw));
+          } catch (e) {}
+        }
+        if (nameRaw) setProfileName(nameRaw);
+
+        if (plansRaw) {
+          try {
+            const parsed = JSON.parse(plansRaw);
+            setPlans(Array.isArray(parsed.plans) ? parsed.plans : []);
+            setActivePlanId(parsed.activePlanId || null);
+          } catch (e) {}
+        } else if (legacyPlanRaw) {
+          try {
+            const old = JSON.parse(legacyPlanRaw);
+            const migrated = { ...old, id: old.id || `plan-${Date.now()}` };
+            setPlans([migrated]);
+            setActivePlanId(migrated.id);
+          } catch (e) {}
+        }
+
+        if (lessonsRaw) {
+          try {
+            setLessons(JSON.parse(lessonsRaw));
+          } catch (e) {}
+        }
+
+        if (pulseRaw) {
+          try {
+            setDailyPulse(JSON.parse(pulseRaw));
+          } catch (e) {}
+        }
+      }
+
+      // Local-only preference, independent of cloud sync — load regardless of source above.
+      const dismissedRaw = await safeGet(scopedStorageKey(STORAGE_BASE_KEYS.nameBannerDismissed, identity));
+      if (dismissedRaw) {
         try {
-          setLessons(JSON.parse(lessonsRaw));
+          setNameBannerDismissed(JSON.parse(dismissedRaw));
         } catch (e) {}
       }
 
-      if (pulseRaw) {
-        try {
-          setDailyPulse(JSON.parse(pulseRaw));
-        } catch (e) {}
+      if (isFirstLoad) {
+        const elapsed = Date.now() - startedAt;
+        const MIN_SPLASH_MS = 2000;
+        if (elapsed < MIN_SPLASH_MS) {
+          await new Promise((r) => setTimeout(r, MIN_SPLASH_MS - elapsed));
+        }
+        setIsLoaded(true);
+      } else {
+        setIsSwitchingAccount(false);
       }
-
-      const elapsed = Date.now() - startedAt;
-      const MIN_SPLASH_MS = 2000;
-      if (elapsed < MIN_SPLASH_MS) {
-        await new Promise((r) => setTimeout(r, MIN_SPLASH_MS - elapsed));
-      }
-      setIsLoaded(true);
     })();
-  }, []);
+  }, [address, cloudEnabled, accountStatus]);
 
-  /* ---- persist locally on change, after initial load ---- */
+  /* ---- persist locally on change, scoped to the current identity ---- */
   useEffect(() => {
-    if (!isLoaded) return;
+    if (!isLoaded || isSwitchingAccount) return;
+    const identity = address || "guest";
     setSyncStatus("saving");
     Promise.all([
-      safeSet(STORAGE_KEYS.captures, JSON.stringify(captures)),
-      safeSet(STORAGE_KEYS.totalXP, JSON.stringify(totalXP)),
-      safeSet(STORAGE_KEYS.messages, JSON.stringify(messages)),
-      safeSet(STORAGE_KEYS.profileName, profileName),
-      safeSet(STORAGE_KEYS.plans, JSON.stringify({ plans, activePlanId })),
-      safeSet(STORAGE_KEYS.lessons, JSON.stringify(lessons)),
-      safeSet(STORAGE_KEYS.dailyPulse, JSON.stringify(dailyPulse)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.captures, identity), JSON.stringify(captures)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.totalXP, identity), JSON.stringify(totalXP)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.messages, identity), JSON.stringify(messages)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.profileName, identity), profileName),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.plans, identity), JSON.stringify({ plans, activePlanId })),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.lessons, identity), JSON.stringify(lessons)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.dailyPulse, identity), JSON.stringify(dailyPulse)),
+      safeSet(scopedStorageKey(STORAGE_BASE_KEYS.nameBannerDismissed, identity), JSON.stringify(nameBannerDismissed)),
     ]).then((results) => {
       setSyncStatus(results.every(Boolean) ? "saved" : "error");
     });
-  }, [captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse, isLoaded]);
+  }, [
+    captures,
+    totalXP,
+    messages,
+    profileName,
+    plans,
+    activePlanId,
+    lessons,
+    dailyPulse,
+    nameBannerDismissed,
+    isLoaded,
+    isSwitchingAccount,
+    address,
+  ]);
 
   /* ---- push to Supabase whenever data changes, if a wallet is connected ---- */
   useEffect(() => {
-    if (!isLoaded || !cloudEnabled || !isConnected || !address) return;
+    if (!isLoaded || isSwitchingAccount || !cloudEnabled || !isConnected || !address) return;
     setCloudSyncStatus("syncing");
     saveCloudData(address, { captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse }).then(
       (ok) => {
         setCloudSyncStatus(ok ? "synced" : "error");
       }
     );
-  }, [captures, totalXP, messages, profileName, plans, activePlanId, lessons, dailyPulse, isLoaded, cloudEnabled, isConnected, address]);
-
-  /* ---- on wallet connect: load existing cloud data, or seed the cloud with local data ---- */
-  useEffect(() => {
-    if (!isLoaded || !cloudEnabled || !isConnected || !address) return;
-    (async () => {
-      setCloudSyncStatus("syncing");
-      const cloud = await loadCloudData(address);
-      if (cloud) {
-        if (Array.isArray(cloud.captures)) setCaptures(cloud.captures);
-        if (typeof cloud.totalXP === "number") setTotalXP(cloud.totalXP);
-        if (Array.isArray(cloud.messages)) setMessages(cloud.messages);
-        if (cloud.profileName) setProfileName(cloud.profileName);
-        if (Array.isArray(cloud.plans)) setPlans(cloud.plans);
-        if (cloud.activePlanId !== undefined) setActivePlanId(cloud.activePlanId);
-        if (Array.isArray(cloud.lessons)) setLessons(cloud.lessons);
-        if (cloud.dailyPulse) setDailyPulse(cloud.dailyPulse);
-        setCloudSyncStatus("synced");
-      } else {
-        const ok = await saveCloudData(address, {
-          captures,
-          totalXP,
-          messages,
-          profileName,
-          plans,
-          activePlanId,
-          lessons,
-          dailyPulse,
-        });
-        setCloudSyncStatus(ok ? "synced" : "error");
-      }
-    })();
-    // Only re-run when the connected wallet itself changes, not on every local edit —
-    // the effect above already handles pushing ongoing changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConnected, address, cloudEnabled, isLoaded]);
+  }, [
+    captures,
+    totalXP,
+    messages,
+    profileName,
+    plans,
+    activePlanId,
+    lessons,
+    dailyPulse,
+    isLoaded,
+    isSwitchingAccount,
+    cloudEnabled,
+    isConnected,
+    address,
+  ]);
 
   function findMatchingStepIndex(steps, matchedStep) {
     if (!matchedStep) return -1;
@@ -2202,15 +2309,17 @@ export default function VibeForgeDashboard() {
   }
 
   async function handleReset() {
+    const identity = address || "guest";
     await Promise.all([
-      safeDelete(STORAGE_KEYS.captures),
-      safeDelete(STORAGE_KEYS.totalXP),
-      safeDelete(STORAGE_KEYS.messages),
-      safeDelete(STORAGE_KEYS.profileName),
-      safeDelete(STORAGE_KEYS.plans),
-      safeDelete(STORAGE_KEYS.legacyActivePlan),
-      safeDelete(STORAGE_KEYS.lessons),
-      safeDelete(STORAGE_KEYS.dailyPulse),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.captures, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.totalXP, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.messages, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.profileName, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.plans, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.lessons, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.dailyPulse, identity)),
+      safeDelete(scopedStorageKey(STORAGE_BASE_KEYS.nameBannerDismissed, identity)),
+      identity === "guest" ? safeDelete("vibeforge:active-plan") : Promise.resolve(),
     ]);
     setCaptures(DEFAULT_CAPTURES);
     setTotalXP(DEFAULT_XP);
@@ -2222,6 +2331,7 @@ export default function VibeForgeDashboard() {
     setLessons([]);
     setSavedLessonIndices(new Set());
     setDailyPulse(null);
+    setNameBannerDismissed(false);
     setAttachedImage(null);
 
     if (cloudEnabled && isConnected && address) {
@@ -2255,6 +2365,7 @@ export default function VibeForgeDashboard() {
             speechError={speechError}
             onToggleRecording={toggleRecording}
             activePlan={activePlan}
+            plans={plans}
             isConnected={isConnected}
             isLoadingChain={isLoadingChain}
             streak={streak}
@@ -2267,6 +2378,9 @@ export default function VibeForgeDashboard() {
             dailyPulse={dailyPulse}
             isGeneratingPulse={isGeneratingPulse}
             onRefreshPulse={generateDailyPulse}
+            nameBannerDismissed={nameBannerDismissed}
+            onSetName={setProfileName}
+            onDismissNameBanner={() => setNameBannerDismissed(true)}
             goTo={setActiveNav}
           />
         );
@@ -2301,7 +2415,7 @@ export default function VibeForgeDashboard() {
           />
         );
       case "projects":
-        return <ProjectsView />;
+        return <ProjectsView plans={plans} goTo={setActiveNav} />;
       case "learning":
         return <LearningView lessons={lessons} plans={plans} />;
       case "copilot":
@@ -2332,7 +2446,7 @@ export default function VibeForgeDashboard() {
           />
         );
       case "analytics":
-        return <AnalyticsView captures={captures} />;
+        return <AnalyticsView captures={captures} totalXP={totalXP} lessons={lessons} />;
       case "settings":
         return (
           <SettingsView
@@ -2528,7 +2642,7 @@ export default function VibeForgeDashboard() {
           <div className="flex items-center gap-2 px-2 pt-3">
             <div className="rounded-full" style={{ width: 28, height: 28, background: "var(--accent)" }} />
             <div className="flex-1">
-              <div className="text-xs font-medium">{profileName}</div>
+              <div className="text-xs font-medium">{profileName || "Builder"}</div>
               {isConnected ? (
                 <div
                   className="vf-t10 vf-link"
@@ -2564,6 +2678,20 @@ export default function VibeForgeDashboard() {
 
       {/* MAIN */}
       <main className="flex-1 p-6 overflow-y-auto vf-scrollbar" style={{ maxHeight: "100vh" }}>
+        {isSwitchingAccount && (
+          <div
+            className="flex items-center gap-2 vf-t11 mb-4"
+            style={{
+              background: "var(--accent-dim)",
+              border: "1px solid var(--accent)",
+              color: "var(--accent-light)",
+              borderRadius: 10,
+              padding: "8px 12px",
+            }}
+          >
+            <Loader2 size={13} className="animate-spin" /> Loading data for this wallet…
+          </div>
+        )}
         {renderPage()}
       </main>
     </div>
