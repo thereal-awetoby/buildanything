@@ -23,6 +23,7 @@ import {
   ImagePlus,
   RefreshCw,
   Sparkles,
+  Menu,
 } from "lucide-react";
 import { useAccount, useConnect, useDisconnect, useWriteContract } from "wagmi";
 import { injected } from "wagmi/connectors";
@@ -311,7 +312,7 @@ function CategoryPill({ category }) {
 
 function PageHeader({ title, subtitle, right }) {
   return (
-    <div className="flex items-center justify-between mb-5">
+    <div className="flex items-center justify-between mb-5 flex-wrap" style={{ gap: 12 }}>
       <div>
         <h1 className="text-2xl font-semibold">{title}</h1>
         {subtitle && (
@@ -569,7 +570,7 @@ function DashboardView({
 
       <DailyPulseCard pulse={dailyPulse} isGenerating={isGeneratingPulse} onRefresh={onRefreshPulse} />
 
-      <div className="grid grid-cols-3 gap-4 mb-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
         <Card>
           <div className="flex items-center justify-between mb-1">
             <h2 className="text-base font-semibold">Vibe Capture</h2>
@@ -636,7 +637,7 @@ function DashboardView({
         <AnalyticsCard captures={captures} compact />
       </div>
 
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <ProjectsCard onViewAll={() => goTo("projects")} plans={plans} goTo={goTo} />
         <CopilotPreviewCard onOpen={() => goTo("copilot")} />
         <OnChainCard
@@ -726,7 +727,7 @@ function CaptureView({
         subtitle="Dump anything, speak it, or paste a screenshot. Claude turns it into a structured journal entry."
         right={<span className="vf-pill">+{totalXP.toLocaleString()} XP total</span>}
       />
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card>
           <div className="flex flex-col items-center py-4">
             <button
@@ -806,6 +807,7 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
 
   if (hasPlan) {
     nodes = activePlan.steps.map((s, i) => ({
+      key: s.id,
       angle: -90 + (360 / activePlan.steps.length) * i,
       done: s.status === "done",
       top: s.status === "done" ? "✓ Done" : "Pending",
@@ -815,6 +817,7 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
   } else if (hasKnowledge) {
     const items = knowledgeSource.slice(0, 6);
     nodes = items.map((item, i) => ({
+      key: item.id || `${item.category}-${i}`,
       angle: -90 + (360 / items.length) * i,
       done: false,
       top: item.category,
@@ -831,6 +834,46 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
   const doneCount = hasPlan ? activePlan.steps.filter((s) => s.status === "done").length : 0;
   const nextPending = hasPlan ? activePlan.steps.find((s) => s.status === "pending") : null;
 
+  // Drag-to-reposition: positions are session-local (per widget instance), not
+  // persisted — dragging is for arranging your current view, not saved layout.
+  const containerRef = useRef(null);
+  const [dragPositions, setDragPositions] = useState({});
+  const [draggingKey, setDraggingKey] = useState(null);
+
+  function defaultPos(angle) {
+    const rad = (angle * Math.PI) / 180;
+    return { x: 50 + 33 * Math.cos(rad), y: 50 + 33 * Math.sin(rad) };
+  }
+
+  function getPos(node) {
+    return dragPositions[node.key] || defaultPos(node.angle);
+  }
+
+  useEffect(() => {
+    if (!draggingKey) return;
+
+    function handlePointerMove(e) {
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      let x = ((e.clientX - rect.left) / rect.width) * 100;
+      let y = ((e.clientY - rect.top) / rect.height) * 100;
+      x = Math.max(6, Math.min(94, x));
+      y = Math.max(6, Math.min(94, y));
+      setDragPositions((prev) => ({ ...prev, [draggingKey]: { x, y } }));
+    }
+    function handlePointerUp() {
+      setDraggingKey(null);
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [draggingKey]);
+
   return (
     <Card>
       <div className="flex items-center justify-between mb-3">
@@ -842,21 +885,20 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
         )}
       </div>
       <div
+        ref={containerRef}
         className="relative w-full mx-auto"
-        style={{ aspectRatio: "1 / 1", maxWidth: full ? 360 : 280 }}
+        style={{ aspectRatio: "1 / 1", maxWidth: full ? 360 : 280, touchAction: "none" }}
       >
-        <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full">
-          {nodes.map((n, i) => {
-            const rad = (n.angle * Math.PI) / 180;
-            const x = 50 + 33 * Math.cos(rad);
-            const y = 50 + 33 * Math.sin(rad);
+        <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }}>
+          {nodes.map((n) => {
+            const pos = getPos(n);
             return (
               <line
-                key={i}
+                key={n.key}
                 x1="50"
                 y1="50"
-                x2={x}
-                y2={y}
+                x2={pos.x}
+                y2={pos.y}
                 stroke={n.done ? "var(--accent)" : "var(--border)"}
                 strokeWidth="0.6"
               />
@@ -877,15 +919,21 @@ function ForgeGraphCard({ onExplore, full, activePlan, lessons = [], captures = 
         >
           {centerLabel}
         </div>
-        {nodes.map((n, i) => {
-          const rad = (n.angle * Math.PI) / 180;
-          const x = 50 + 33 * Math.cos(rad);
-          const y = 50 + 33 * Math.sin(rad);
+        {nodes.map((n) => {
+          const pos = getPos(n);
           return (
             <div
-              key={i}
-              className="vf-node"
-              style={n.done ? { top: `${y}%`, left: `${x}%`, borderColor: "var(--green)" } : { top: `${y}%`, left: `${x}%` }}
+              key={n.key}
+              className="vf-node vf-node-draggable"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                setDraggingKey(n.key);
+              }}
+              style={
+                n.done
+                  ? { top: `${pos.y}%`, left: `${pos.x}%`, borderColor: "var(--green)" }
+                  : { top: `${pos.y}%`, left: `${pos.x}%` }
+              }
             >
               <div style={{ fontWeight: 600, color: n.done ? "var(--green)" : "var(--text-1)" }}>{n.top}</div>
               <div style={{ color: "var(--text-3)" }}>{n.sub}</div>
@@ -980,7 +1028,7 @@ function ForgeView({ plans, activePlan, onSwitchPlan, onDeletePlan, lessons, cap
           })}
         </div>
       )}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="col-span-2">
           <ForgeGraphCard full activePlan={activePlan} lessons={lessons} captures={captures} />
         </div>
@@ -1041,7 +1089,7 @@ function ProjectsCard({ onViewAll, full, plans = [], goTo }) {
           tracking one here.
         </p>
       ) : (
-        <div className={full ? "grid grid-cols-3 gap-3" : "flex flex-col gap-2"}>
+        <div className={full ? "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3" : "flex flex-col gap-2"}>
           {plans.map((p) => {
             const done = p.steps.filter((s) => s.status === "done").length;
             const pct = p.steps.length ? Math.round((done / p.steps.length) * 100) : 0;
@@ -1101,7 +1149,7 @@ function LearningView({ lessons, plans }) {
           {badges.length === 1 ? "" : "s"} earned
         </div>
       </Card>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card className="col-span-2">
           <div className="text-sm font-medium mb-3">Lessons</div>
           {lessons.length === 0 ? (
@@ -1340,10 +1388,24 @@ function CopilotView({
   savingLessonIndex,
   savedLessonIndices,
   onSaveAsLesson,
+  onClearChat,
 }) {
   return (
     <>
-      <PageHeader title="Vibe Co-Pilot" subtitle="Your build assistant. Save any plan or lesson worth keeping." />
+      <PageHeader
+        title="Vibe Co-Pilot"
+        subtitle="Your build assistant. Save any plan or lesson worth keeping."
+        right={
+          <button
+            type="button"
+            className="vf-btn-primary"
+            style={{ background: "var(--bg-surface-2)", color: "var(--text-2)" }}
+            onClick={onClearChat}
+          >
+            <RotateCcw size={13} /> New Chat
+          </button>
+        }
+      />
       <ChatPanel
         messages={messages}
         input={input}
@@ -1487,7 +1549,7 @@ function OnChainView({ isConnected, isLoadingChain, streak, heartbeats, isLoadin
             : "No VITE_CONTRACT_ADDRESS set yet — add it to .env once Builder A's contract is deployed."
         }
       />
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="col-span-2">
           <OnChainCard full isConnected={isConnected} isLoadingChain={isLoadingChain} streak={streak} heartbeats={heartbeats} />
         </div>
@@ -1595,11 +1657,11 @@ function AnalyticsView({ captures, totalXP, lessons }) {
   return (
     <>
       <PageHeader title="Analytics" subtitle="Weekly XP trend, capture categories, and real stats — all computed live from your own data." />
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <AnalyticsCard captures={captures} />
         <Card>
           <div className="text-sm font-medium mb-3">Overview</div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {stats.map((s) => (
               <div
                 key={s.label}
@@ -1638,7 +1700,7 @@ function SettingsView({
   return (
     <>
       <PageHeader title="Settings" subtitle="Profile and local data." />
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Card>
           <div className="text-sm font-medium mb-3">Profile</div>
           <label className="vf-t11 block mb-1" style={{ color: "var(--text-3)" }}>
@@ -1763,6 +1825,7 @@ export default function VibeForgeDashboard() {
   const [isGeneratingPulse, setIsGeneratingPulse] = useState(false);
 
   const [nameBannerDismissed, setNameBannerDismissed] = useState(false);
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
 
   const { address, isConnected, status: accountStatus } = useAccount();
   const { connect } = useConnect();
@@ -2201,6 +2264,13 @@ export default function VibeForgeDashboard() {
     }
   }
 
+  function handleClearChat() {
+    setMessages(DEFAULT_MESSAGES);
+    setCopilotInput("");
+    setSavedMessageIndices(new Set());
+    setSavedLessonIndices(new Set());
+  }
+
   async function handleSaveAsPlan(messageIndex, content) {
     setSavingMessageIndex(messageIndex);
     try {
@@ -2461,6 +2531,7 @@ export default function VibeForgeDashboard() {
             savingLessonIndex={savingLessonIndex}
             savedLessonIndices={savedLessonIndices}
             onSaveAsLesson={handleSaveAsLesson}
+            onClearChat={handleClearChat}
           />
         );
       case "onchain":
@@ -2529,6 +2600,40 @@ export default function VibeForgeDashboard() {
           display: flex;
           flex-direction: column;
           gap: 4px;
+        }
+        .vf-sidebar-close { display: none; }
+        .vf-mobile-topbar { display: none; }
+        .vf-sidebar-backdrop { display: none; }
+        @media (max-width: 860px) {
+          .vf-sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            width: 240px;
+            z-index: 60;
+            background: var(--bg-base);
+            transform: translateX(-100%);
+            transition: transform 0.22s ease;
+          }
+          .vf-sidebar.vf-sidebar-open {
+            transform: translateX(0);
+            box-shadow: 0 0 48px rgba(0, 0, 0, 0.55);
+          }
+          .vf-sidebar-close { display: flex; }
+          .vf-mobile-topbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+          }
+          .vf-sidebar-backdrop {
+            display: block;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 55;
+          }
         }
         .vf-nav-item {
           display: flex;
@@ -2624,6 +2729,8 @@ export default function VibeForgeDashboard() {
           font-size: 10.5px;
           white-space: nowrap;
         }
+        .vf-node-draggable { cursor: grab; user-select: none; }
+        .vf-node-draggable:active { cursor: grabbing; }
         .vf-link { cursor: pointer; }
         .vf-link:hover { text-decoration: underline; }
         .vf-scrollbar::-webkit-scrollbar { width: 5px; }
@@ -2659,27 +2766,41 @@ export default function VibeForgeDashboard() {
       `}</style>
 
       {/* SIDEBAR */}
-      <aside className="vf-sidebar">
-        <div className="flex items-center gap-2 px-2 pb-5">
-          <div
-            className="flex items-center justify-center rounded-lg"
-            style={{ width: 30, height: 30, background: "var(--accent-dim)" }}
-          >
-            <VibeForgeLogo size={18} />
-          </div>
-          <div>
-            <div className="text-sm font-semibold leading-none">VibeForge</div>
-            <div className="vf-t10 leading-none mt-1" style={{ color: "var(--text-3)" }}>
-              Builder OS
+      <aside className={`vf-sidebar ${isMobileNavOpen ? "vf-sidebar-open" : ""}`}>
+        <div className="flex items-center gap-2 px-2 pb-5" style={{ justifyContent: "space-between" }}>
+          <div className="flex items-center gap-2">
+            <div
+              className="flex items-center justify-center rounded-lg"
+              style={{ width: 30, height: 30, background: "var(--accent-dim)" }}
+            >
+              <VibeForgeLogo size={18} />
+            </div>
+            <div>
+              <div className="text-sm font-semibold leading-none">VibeForge</div>
+              <div className="vf-t10 leading-none mt-1" style={{ color: "var(--text-3)" }}>
+                Builder OS
+              </div>
             </div>
           </div>
+          <button
+            type="button"
+            className="vf-sidebar-close"
+            aria-label="Close menu"
+            onClick={() => setIsMobileNavOpen(false)}
+            style={{ background: "none", border: "none", color: "var(--text-3)", cursor: "pointer" }}
+          >
+            <X size={18} />
+          </button>
         </div>
 
         {NAV_ITEMS.map((item) => (
           <div
             key={item.key}
             className={`vf-nav-item ${activeNav === item.key ? "active" : ""}`}
-            onClick={() => setActiveNav(item.key)}
+            onClick={() => {
+              setActiveNav(item.key);
+              setIsMobileNavOpen(false);
+            }}
           >
             <item.icon size={16} />
             {item.label}
@@ -2689,7 +2810,10 @@ export default function VibeForgeDashboard() {
         <div className="mt-auto pt-4" style={{ borderTop: "1px solid var(--border)" }}>
           <div
             className={`vf-nav-item ${activeNav === "settings" ? "active" : ""}`}
-            onClick={() => setActiveNav("settings")}
+            onClick={() => {
+              setActiveNav("settings");
+              setIsMobileNavOpen(false);
+            }}
           >
             <SettingsIcon size={16} />
             Settings
@@ -2731,8 +2855,22 @@ export default function VibeForgeDashboard() {
         </div>
       </aside>
 
+      {isMobileNavOpen && <div className="vf-sidebar-backdrop" onClick={() => setIsMobileNavOpen(false)} />}
+
       {/* MAIN */}
-      <main className="flex-1 p-6 overflow-y-auto vf-scrollbar" style={{ maxHeight: "100vh" }}>
+      <main className="flex-1 p-4 sm:p-6 overflow-y-auto vf-scrollbar" style={{ maxHeight: "100vh" }}>
+        <div className="vf-mobile-topbar">
+          <button
+            type="button"
+            aria-label="Open menu"
+            onClick={() => setIsMobileNavOpen(true)}
+            style={{ background: "none", border: "none", color: "var(--text-1)", cursor: "pointer", display: "flex" }}
+          >
+            <Menu size={22} />
+          </button>
+          <VibeForgeLogo size={18} />
+          <span className="text-sm font-semibold">VibeForge</span>
+        </div>
         {isSwitchingAccount && (
           <div
             className="flex items-center gap-2 vf-t11 mb-4"
