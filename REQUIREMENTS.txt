@@ -1,0 +1,8 @@
+ADD MONAD TEST TO METAMASK WALLET
+10143
+RPC URL: https://testnet-rpc.monad.xyz
+Currency: MON
+Explorer: https://testnet.monadexplorer.com
+
+REQUEST MONAD TEST TOKENS 
+https://faucet.monad.xyz/
